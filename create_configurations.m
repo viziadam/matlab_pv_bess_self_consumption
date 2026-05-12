@@ -37,12 +37,14 @@ function cfg = create_configurations(basePath)
     cfg.cost.project_lifetime_years = 20;
     cfg.cost.pv_lifetime_years = 25;
     cfg.cost.inverter_lifetime_years = 15;
-    cfg.cost.discount_rate = 0.08;
+    cfg.cost.discount_rate = 0.06;
     
     %Costs
-    cfg.cost.eur_to_huf = 400;
+    cfg.cost.eur_to_huf = 350;
+    % cfg.cost.pv_huf_per_kWp = cfg.cost.eur_to_huf*500;
+    cfg.cost.bess_huf_per_kWh = cfg.cost.eur_to_huf * 320;
     cfg.cost.pv_huf_per_kWp = 250000;
-    cfg.cost.bess_huf_per_kWh = cfg.cost.eur_to_huf * 400;
+    %cfg.cost.bess_huf_per_kWh = 80000;
     cfg.cost.bess_power_huf_per_kW = 0;
     cfg.cost.inverter_huf_per_kW = 50000;
 
@@ -50,7 +52,7 @@ function cfg = create_configurations(basePath)
     cfg.cost.bess_opex_frac_per_year = 0.020;
     cfg.cost.inverter_opex_frac_per_year = 0.010;
 
-    cfg.cost.grid_import_huf_per_kWh = 75;
+    cfg.cost.grid_import_huf_per_kWh = 100;
     cfg.cost.grid_export_huf_per_kWh = 0;
 
     if ~exist(cfg.paths.results, 'dir')
@@ -169,10 +171,10 @@ function cfg = create_configurations(basePath)
     % Costs
     % Ezek tovabbra is helytarto ertekek, kesobb pontosithatok.
     % ---------------------------------------------------------------------
-    cfg.cost.pv_huf_per_kWp = 250000;
-    cfg.cost.bess_huf_per_kWh = 120000;
-    cfg.cost.bess_power_huf_per_kW = 30000;
-    cfg.cost.inverter_huf_per_kW = 50000;
+    % cfg.cost.pv_huf_per_kWp = 250000;
+    % cfg.cost.bess_huf_per_kWh = 120000;
+    % cfg.cost.bess_power_huf_per_kW = 0;
+    % cfg.cost.inverter_huf_per_kW = 50000;
 
     % Grid-connected self-consumption gazdasagi parameterek.
     cfg.cost.grid_import_huf_per_kWh = 75;
@@ -187,6 +189,46 @@ function cfg = create_configurations(basePath)
     % Ha true, akkor a metrikafrissites hibat dob, ha egy dayVectors source
     % mezo hianyzik.
     cfg.sim.strictMetricSources = true;
+
+    % Evaluation
+    % ---------------------------------------------------------------------
+    cfg.evaluation = struct();
+
+    % Ezt a MAT fajlt tolti be az evaluation()
+    if cfg.system.bessCoupling == "dc"
+        cfg.evaluation.resultFileName = "results_dccoupled.mat";
+    else
+        cfg.evaluation.resultFileName = "results_accoupled.mat";
+    end
+
+    % Szimulalt idoszak hossza evben
+    cfg.evaluation.simYears = 4;
+
+    % Legjobb rendszer kivalasztasi modja:
+    % "minLCSE", "minLCOE", "maxNPV", "minPayback", "minStaticPayback", "maxIRR"
+    cfg.evaluation.selectionMode = "minLCSE";
+
+    % Szurok a legjobb candidate valasztashoz
+    cfg.evaluation.minGridImportReduction_pct = 0;
+    cfg.evaluation.requirePositiveNPV = false;
+    cfg.evaluation.requireBESS = false;
+
+    % Ha false: csak LCSE, LCOE, NPV kap 3D scatter + heatmap abrat
+    % Ha true: minden implementalt mutato kap 3D scatter + heatmap abrat
+    cfg.evaluation.plotAllMetricMaps = false;
+
+    % ---------------------------------------------------------------------
+    % Diagnostics / algorithm verification template
+    % ---------------------------------------------------------------------
+    % Alapertelmezetten nem fut a main reszekent. Kezi ellenorzeshez:
+    %   diagnostics = run_simulation_diagnostics(cfg);
+    % vagy allitsd cfg.diagnostics.enabled = true ertekre ebben a konfiguracioban.
+    cfg.diagnostics.enabled = true;
+    cfg.diagnostics.makePlots = true;
+    cfg.diagnostics.figureVisible = "off";
+    cfg.diagnostics.nDays = 3;
+    cfg.diagnostics.dt_h = 0.25;
+    cfg.diagnostics.couplings = ["dc", "ac"];
 
     % ---------------------------------------------------------------------
     % OUTPUT METRICS - SCALAR

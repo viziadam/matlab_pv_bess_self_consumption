@@ -837,6 +837,9 @@ function T = local_create_candidate_table(n, cfg, designFields)
     T.errorMessage = strings(n, 1);
     T.runtime_s = NaN(n, 1);
 
+    T.finalSoH = NaN(n, 1);
+    T.finalSoC = NaN(n, 1);
+
     % ---------------------------------------------------------------------
     % Dynamic scalar metrics from cfg.output.scalarMetrics
     % ---------------------------------------------------------------------

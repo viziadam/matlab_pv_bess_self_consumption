@@ -24,8 +24,8 @@ function DB =  main()
 
     cfg = create_configurations(basePath);
 
-    % % [analysisResult, cfg] = analyze_load_profiles(cfg);
-    % cfg.candidates.P_inv_kW_vec = [950, 1100, 1200, 1850];
+    % [analysisResult, cfg] = analyze_load_profiles(cfg);
+    % %cfg.candidates.P_inv_kW_vec = [950, 1100, 1200, 1850];
     % disp(cfg.candidates.P_inv_kW_vec);
     % 
     % data = build_data(cfg);
@@ -40,7 +40,13 @@ function DB =  main()
     % fprintf('Candidates: %d\n', height(DB.candidateTable));
     % fprintf('Saved to: %s\n', fullfile(cfg.paths.results, 'offgrid_candidate_database.mat'));
 
-    evaluationResult = evaluation(cfg);
+    evalCfg = create_evaluation_config(cfg);
+    evaluationResult = evaluation(cfg, evalCfg);
+
+    if isfield(cfg, 'diagnostics') && isfield(cfg.diagnostics, 'enabled') && ...
+       cfg.diagnostics.enabled
+       DB.diagnostics = run_simulation_diagnostics(cfg, cfg.diagnostics);
+    end
 
 
 

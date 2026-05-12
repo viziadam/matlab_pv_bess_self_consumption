@@ -1,20 +1,32 @@
-function result = process_load_to_structured_data(txtFilePath, savePath)
-% PROCESS_ELECTRICITYLOADDIAGRAMS_INDUSTRY_FOR_BESS
-% use: process_load_to_structured_data('C:\Users\Vizi\Desktop\Egyetem\MSC VIK\Villamosmérnök\Diplomamunka\Napelemes rendszerek\Szimulaciok\Rendszerelemzes\industrial_use_case-self-consumption\consumption_csv\LD2011_2014.txt', 'C:\Users\Vizi\Desktop\Egyetem\MSC VIK\Villamosmérnök\Diplomamunka\Napelemes rendszerek\Szimulaciok\Rendszerelemzes\industrial_use_case-self-consumption\consumption')
+function result = process_load_to_structured_data(txtFileName)
+% PROCESS_LOAD_TO_STRUCTURED_DATA
+%
 % ElectricityLoadDiagrams20112014 dataset feldolgozasa PV+BESS
 % onfogyasztas-novelesi vizsgalathoz.
 %
-% Bemenet:
-%   txtFilePath : ElectricityLoadDiagrams txt fajl teljes eleresi utvonala
-%   savePath    : mappa, ahova a napi .mat fajlok kerulnek
+% Hasznalat:
+%
+%   result = process_load_to_structured_data('LD2011_2014.txt');
+%
+% Automatikus mappaszerkezet:
+%
+%   current_function_folder/
+%       process_load_to_structured_data.m
+%       consumption_csv/
+%           LD2011_2014.txt
+%       consumption/
+%           consumption_ORIG_yyyy_mm_dd.mat
 %
 % A fuggveny:
 %   1) Beolvassa a 15 perces fogyasztasi adatokat.
 %   2) Kiszuri az ervenyes fogyasztokat.
 %   3) Heurisztikusan besorolja oket:
 %        residential / commercial / industry
-%   4) Az industry jellegu fogyasztok kozul kivalaszt egyet,
-%      amelynek uzemi napi profilcsucsa kb. 800 kW.
+%   4) Kivalaszt egy ipari profilt, amelynel:
+%        - a csucsteljesitmeny legalabb 100 kW
+%        - a 10:00-14:00 kozotti fogyasztasi energia aranya
+%          a teljes napi fogyasztashoz kepest a legkisebb
+%        - tehat PV termelesi csucsidoben kedvezotlenebb az onfogyasztas
 %   5) A kivalasztott fogyasztot napi .mat fajlokra bontja.
 %
 % Megjegyzes:
@@ -22,17 +34,28 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
 %   Az industry/commercial/residential besorolas heurisztikus.
 
     % ---------------------------------------------------------------------
-    % 0) Beallitasok
+    % 0) Automatikus utvonalak
     % ---------------------------------------------------------------------
-    targetProductionPeak_kW = 800;     % celzott uzemi csucs kb. 800 kW
-    minActiveDays = 300;               % legalabb kb. egy ev aktiv adat
-    outputResolutionMin = 30;          % Ausgridhez hasonlo 30 perces kimenet
+    if nargin < 1 || strlength(string(txtFileName)) == 0
+        error('Meg kell adni a bemeneti txt fajl nevet. Pelda: process_load_to_structured_data(''LD2011_2014.txt'')');
+    end
 
-    productionStartHour = 8;           % uzemi idoszak kezdete
-    productionEndHour   = 22;          % uzemi idoszak vege
+    txtFileName = char(txtFileName);
 
-    offHourMorningEnd = 6;             % uzemen kivuli reggeli veg
-    offHourEveningStart = 22;          % uzemen kivuli esti kezd
+    if contains(txtFileName, filesep) || contains(txtFileName, '/')
+        error('Csak a fajlnevet add meg, ne teljes eleresi utvonalat. Pelda: LD2011_2014.txt');
+    end
+
+    functionFullPath = mfilename('fullpath');
+    functionFolderPath = fileparts(functionFullPath);
+
+    inputFolderPath = fullfile(functionFolderPath, 'consumption_csv');
+    savePath = fullfile(functionFolderPath, 'consumption');
+
+    txtFilePath = fullfile(inputFolderPath, txtFileName);
+
+    assert(isfolder(inputFolderPath), ...
+        'Hiba: A consumption_csv mappa nem talalhato: %s', inputFolderPath);
 
     assert(isfile(txtFilePath), ...
         'Hiba: A megadott txt fajl nem talalhato: %s', txtFilePath);
@@ -42,17 +65,56 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     end
 
     fprintf('ElectricityLoadDiagrams feldolgozas indul...\n');
+    fprintf('Fuggveny mappa: %s\n', functionFolderPath);
     fprintf('Bemeneti fajl: %s\n', txtFilePath);
     fprintf('Mentesi mappa: %s\n\n', savePath);
 
     % ---------------------------------------------------------------------
-    % 1) Decimalis vesszo kezelese
+    % 1) Kivalasztasi beallitasok
     % ---------------------------------------------------------------------
-    tempFilePath = local_create_decimal_dot_copy(txtFilePath);
-    cleanupObj = onCleanup(@() local_delete_temp_file(tempFilePath));
+
+    % Most nem celzott 400 kW koruli csucsot keresunk.
+    % Csak az a feltetel, hogy ipari profil legyen es legalabb 100 kW felett legyen.
+    minSelectionPeak_kW = 100;
+
+    % Legalabb kb. egy ev aktiv adat.
+    minActiveDays = 300;
+
+    % A kimenet 30 perces legyen, hogy illeszkedjen a tovabbi keretrendszerhez.
+    outputResolutionMin = 30;
+
+    % Uzemi idoszak.
+    productionStartHour = 6;
+    productionEndHour   = 22;
+
+    % PV-termelesi csucsidő, ahol minél kisebb fogyasztási arányt keresünk.
+    pvPeakStartHour = 10;
+    pvPeakEndHour   = 14;
+
+    % Nem-PV idoszakok csak diagnosztikai metrikakhoz.
+    morningNonPvPeakStartHour = 6;
+    morningNonPvPeakEndHour   = 10;
+
+    eveningNonPvPeakStartHour = 15;
+    eveningNonPvPeakEndHour   = 22;
+
+    % Uzemen kivuli idoszak.
+    offHourMorningEnd = 6;
+    offHourEveningStart = 22;
+
+    % Szigoritott ipari jelleg feltetelek.
+    minIndustrialLoadFactor = 0.35;
+    minIndustrialNightRatio = 0.18;
+    minIndustrialWeekendRatio = 0.55;
 
     % ---------------------------------------------------------------------
-    % 2) Beolvasas
+    % 2) Decimalis vesszo kezelese
+    % ---------------------------------------------------------------------
+    tempFilePath = local_create_decimal_dot_copy(txtFilePath);
+    cleanupObj = onCleanup(@() local_delete_temp_file(tempFilePath)); %#ok<NASGU>
+
+    % ---------------------------------------------------------------------
+    % 3) Beolvasas
     % ---------------------------------------------------------------------
     fprintf('Fajl beolvasasa...\n');
 
@@ -62,10 +124,8 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
 
     opts.VariableNamingRule = 'preserve';
 
-    % Elso oszlop: idobelyeg
     opts = setvartype(opts, opts.VariableNames{1}, 'char');
 
-    % Tobbi oszlop: numerikus fogyasztasi adat
     for i = 2:numel(opts.VariableNames)
         opts = setvartype(opts, opts.VariableNames{i}, 'double');
     end
@@ -82,6 +142,7 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     customerNames = erase(customerNames, '"');
 
     P_kW = table2array(T(:, 2:end));
+    P_kW(P_kW < 0) = NaN;
 
     nSamples = size(P_kW, 1);
     nCustomers = size(P_kW, 2);
@@ -90,7 +151,7 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     fprintf('Fogyasztok szama: %d\n', nCustomers);
 
     % ---------------------------------------------------------------------
-    % 3) Mintaveteli ido
+    % 4) Mintaveteli ido
     % ---------------------------------------------------------------------
     dtOriginal_h = hours(median(diff(time)));
 
@@ -103,7 +164,7 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     samplesPerDayOriginal = round(24 / dtOriginal_h);
 
     % ---------------------------------------------------------------------
-    % 4) Fogyasztoi jellemzok es napi atlagprofilok
+    % 5) Fogyasztoi jellemzok es napi atlagprofilok
     % ---------------------------------------------------------------------
     fprintf('Fogyasztoi jellemzok szamitasa...\n');
 
@@ -175,14 +236,15 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
         end
 
         if any(isWeekend) && any(isWeekday)
+
             weekendEnergy_kWh = sum(pWin(isWeekend), 'omitnan') * dtOriginal_h;
             weekdayEnergy_kWh = sum(pWin(isWeekday), 'omitnan') * dtOriginal_h;
 
             weekendHours = sum(isWeekend) * dtOriginal_h;
             weekdayHours = sum(isWeekday) * dtOriginal_h;
 
-            avgWeekendPower = weekendEnergy_kWh / weekendHours;
-            avgWeekdayPower = weekdayEnergy_kWh / weekdayHours;
+            avgWeekendPower = weekendEnergy_kWh / max(weekendHours, eps);
+            avgWeekdayPower = weekdayEnergy_kWh / max(weekdayHours, eps);
 
             if avgWeekdayPower > 0
                 weekendToWeekdayRatio(c) = avgWeekendPower / avgWeekdayPower;
@@ -191,11 +253,10 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
 
         dailyProfiles_kW(:, c) = local_average_daily_profile( ...
             tWin, pWin, samplesPerDayOriginal);
-
     end
 
     % ---------------------------------------------------------------------
-    % 5) Ervenyes fogyasztok megtartasa
+    % 6) Ervenyes fogyasztok megtartasa
     % ---------------------------------------------------------------------
     P_kW = P_kW(:, validCustomer);
     customerNames = customerNames(validCustomer);
@@ -215,8 +276,12 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
 
     fprintf('Ervenyes fogyasztok szama: %d\n', nValidCustomers);
 
+    if nValidCustomers == 0
+        error('Nincs egyetlen ervenyes fogyaszto sem.');
+    end
+
     % ---------------------------------------------------------------------
-    % 6) Heurisztikus residential / commercial / industry besorolas
+    % 7) Heurisztikus residential / commercial / industry besorolas
     % ---------------------------------------------------------------------
     category = strings(1, nValidCustomers);
 
@@ -253,143 +318,382 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     end
 
     % ---------------------------------------------------------------------
-    % 7) Kivalasztas: industry profil kb. 800 kW uzemi csuccsal
+    % 8) Szigoritott ipari jelleg
+    % ---------------------------------------------------------------------
+    strictIndustry = false(1, nValidCustomers);
+
+    for c = 1:nValidCustomers
+
+        LF = loadFactor(c);
+        NR = nightRatio(c);
+        DR = daytimeRatio(c);
+        WR = weekendToWeekdayRatio(c);
+
+        if isnan(WR)
+            WR = 0;
+        end
+
+        industrialContinuity = ...
+            LF >= minIndustrialLoadFactor || ...
+            NR >= minIndustrialNightRatio || ...
+            WR >= minIndustrialWeekendRatio;
+
+        likelyCommercialBuilding = ...
+            DR >= 0.55 && ...
+            NR < minIndustrialNightRatio && ...
+            WR < 0.45;
+
+        strictIndustry(c) = ...
+            category(c) == "industry" && ...
+            industrialContinuity && ...
+            ~likelyCommercialBuilding;
+    end
+
+    % ---------------------------------------------------------------------
+    % 9) Ipari profilkivalasztasi metrikak
     % ---------------------------------------------------------------------
     fprintf('\nIndustry jellegu profil kivalasztasa...\n');
 
-    timeOfDayOriginal = duration(0, 0, 0) + minutes((0:samplesPerDayOriginal-1) * dtOriginal_h * 60);
+    timeOfDayOriginal = duration(0, 0, 0) + ...
+        minutes((0:samplesPerDayOriginal-1) * dtOriginal_h * 60);
+
     hourAxis = hours(timeOfDayOriginal);
 
-    isProductionTime = hourAxis >= productionStartHour & hourAxis < productionEndHour;
-    isOffTime = hourAxis < offHourMorningEnd | hourAxis >= offHourEveningStart;
+    isProductionTime = ...
+        hourAxis >= productionStartHour & ...
+        hourAxis < productionEndHour;
+
+    isPvPeakWindow = ...
+        hourAxis >= pvPeakStartHour & ...
+        hourAxis < pvPeakEndHour;
+
+    isMorningNonPvPeak = ...
+        hourAxis >= morningNonPvPeakStartHour & ...
+        hourAxis < morningNonPvPeakEndHour;
+
+    isEveningNonPvPeak = ...
+        hourAxis >= eveningNonPvPeakStartHour & ...
+        hourAxis < eveningNonPvPeakEndHour;
+
+    isNonPvPeakWindow = isMorningNonPvPeak | isEveningNonPvPeak;
+
+    isOffTime = ...
+        hourAxis < offHourMorningEnd | ...
+        hourAxis >= offHourEveningStart;
 
     productionPeakDaily_kW = nan(1, nValidCustomers);
     productionMeanDaily_kW = nan(1, nValidCustomers);
+
+    nonPvPeakDaily_kW = nan(1, nValidCustomers);
+    nonPvPeakHour = nan(1, nValidCustomers);
+
+    pvPeakWindowMean_kW = nan(1, nValidCustomers);
+    pvPeakWindowPeak_kW = nan(1, nValidCustomers);
+    pvPeakWindowEnergy_kWh = nan(1, nValidCustomers);
+
+    totalDailyProfileEnergy_kWh = nan(1, nValidCustomers);
+
+    pvWindowToTotalEnergyRatio = nan(1, nValidCustomers);
+    pvWindowMeanToDailyMeanRatio = nan(1, nValidCustomers);
+
+    middayDip_kW = nan(1, nValidCustomers);
+    middayDipPercent = nan(1, nValidCustomers);
+
     offMeanDaily_kW = nan(1, nValidCustomers);
-    offToProductionRatio = nan(1, nValidCustomers);
+    offToNonPvPeakRatio = nan(1, nValidCustomers);
+
+    globalPeakHour = nan(1, nValidCustomers);
+    globalPeakDuringPVPeakWindow = false(1, nValidCustomers);
+
     selectionScore = nan(1, nValidCustomers);
 
     for c = 1:nValidCustomers
 
         prof = dailyProfiles_kW(:, c);
 
-        productionPeakDaily_kW(c) = max(prof(isProductionTime), [], 'omitnan');
-        productionMeanDaily_kW(c) = mean(prof(isProductionTime), 'omitnan');
-        offMeanDaily_kW(c) = mean(prof(isOffTime), 'omitnan');
-
-        if productionPeakDaily_kW(c) > 0
-            offToProductionRatio(c) = offMeanDaily_kW(c) / productionPeakDaily_kW(c);
+        if all(isnan(prof))
+            continue;
         end
 
-        peakError = abs(productionPeakDaily_kW(c) - targetProductionPeak_kW) / targetProductionPeak_kW;
+        % Teljes napi energia az atlagprofilbol.
+        totalDailyProfileEnergy_kWh(c) = sum(prof, 'omitnan') * dtOriginal_h;
 
-        % A kisebb score jobb.
-        % Fontos:
-        %   - legyen kozel 800 kW az uzemi csucs
-        %   - legyen alacsonyabb az uzemen kivuli fogyasztas
-        %   - legyen eleg hosszu aktiv idosor
+        productionPeakDaily_kW(c) = max(prof(isProductionTime), [], 'omitnan');
+        productionMeanDaily_kW(c) = mean(prof(isProductionTime), 'omitnan');
+
+        [nonPvPeakDaily_kW(c), idxLocalNonPv] = max(prof(isNonPvPeakWindow), [], 'omitnan');
+        nonPvHours = hourAxis(isNonPvPeakWindow);
+
+        if ~isempty(idxLocalNonPv) && ~isnan(nonPvPeakDaily_kW(c))
+            nonPvPeakHour(c) = nonPvHours(idxLocalNonPv);
+        end
+
+        pvPeakWindowMean_kW(c) = mean(prof(isPvPeakWindow), 'omitnan');
+        pvPeakWindowPeak_kW(c) = max(prof(isPvPeakWindow), [], 'omitnan');
+
+        pvPeakWindowEnergy_kWh(c) = sum(prof(isPvPeakWindow), 'omitnan') * dtOriginal_h;
+
+        if totalDailyProfileEnergy_kWh(c) > 0
+            pvWindowToTotalEnergyRatio(c) = ...
+                pvPeakWindowEnergy_kWh(c) / totalDailyProfileEnergy_kWh(c);
+        end
+
+        dailyMean_kW = mean(prof, 'omitnan');
+
+        if dailyMean_kW > 0
+            pvWindowMeanToDailyMeanRatio(c) = ...
+                pvPeakWindowMean_kW(c) / dailyMean_kW;
+        end
+
+        offMeanDaily_kW(c) = mean(prof(isOffTime), 'omitnan');
+
+        [~, idxGlobalPeak] = max(prof, [], 'omitnan');
+        globalPeakHour(c) = hourAxis(idxGlobalPeak);
+
+        globalPeakDuringPVPeakWindow(c) = ...
+            globalPeakHour(c) >= pvPeakStartHour && ...
+            globalPeakHour(c) < pvPeakEndHour;
+
+        if nonPvPeakDaily_kW(c) > 0
+
+            middayDip_kW(c) = ...
+                nonPvPeakDaily_kW(c) - pvPeakWindowMean_kW(c);
+
+            middayDipPercent(c) = ...
+                local_safe_divide(middayDip_kW(c), nonPvPeakDaily_kW(c));
+
+            offToNonPvPeakRatio(c) = ...
+                offMeanDaily_kW(c) / nonPvPeakDaily_kW(c);
+        end
+
+        % -------------------------------------------------------------
+        % Kivalasztasi score
+        % -------------------------------------------------------------
+        % A legfontosabb tag:
+        %   10-14 kozotti energia / teljes napi energia.
+        %
+        % Minel kisebb, annal jobb.
+        %
+        % Nincs 400 kW-os cel, a peak csak minimumfeltetel.
+        if isnan(pvWindowToTotalEnergyRatio(c))
+            pvEnergyShareTerm = 10;
+        else
+            pvEnergyShareTerm = pvWindowToTotalEnergyRatio(c);
+        end
+
+        if isnan(pvWindowMeanToDailyMeanRatio(c))
+            pvMeanTerm = 2;
+        else
+            pvMeanTerm = pvWindowMeanToDailyMeanRatio(c);
+        end
+
         activePenalty = 0;
         if activeDays(c) < minActiveDays
             activePenalty = 10;
         end
 
-        categoryPenalty = 0;
-        if category(c) ~= "industry"
-            categoryPenalty = 5;
+        industryPenalty = 0;
+        if ~strictIndustry(c)
+            industryPenalty = 5;
         end
 
+        peakPenalty = 0;
+        if peakPower_kW(c) < minSelectionPeak_kW
+            peakPenalty = 10;
+        end
+
+        pvPeakGlobalPenalty = 0;
+        if globalPeakDuringPVPeakWindow(c)
+            pvPeakGlobalPenalty = 0.5;
+        end
+
+        % A kisebb score jobb.
         selectionScore(c) = ...
-            peakError + ...
-            0.75 * offToProductionRatio(c) + ...
+            10.00 * pvEnergyShareTerm + ...
+            1.00  * pvMeanTerm + ...
+            pvPeakGlobalPenalty + ...
             activePenalty + ...
-            categoryPenalty;
+            industryPenalty + ...
+            peakPenalty;
     end
 
+    % ---------------------------------------------------------------------
+    % 10) Candidate table
+    % ---------------------------------------------------------------------
     candidateTable = table( ...
         customerNames(:), ...
         category(:), ...
+        strictIndustry(:), ...
         activeDays(:), ...
         avgDailyEnergy_kWh(:), ...
+        meanPower_kW(:), ...
         peakPower_kW(:), ...
+        loadFactor(:), ...
+        nightRatio(:), ...
+        daytimeRatio(:), ...
+        weekendToWeekdayRatio(:), ...
         productionPeakDaily_kW(:), ...
         productionMeanDaily_kW(:), ...
+        nonPvPeakDaily_kW(:), ...
+        nonPvPeakHour(:), ...
+        pvPeakWindowMean_kW(:), ...
+        pvPeakWindowPeak_kW(:), ...
+        pvPeakWindowEnergy_kWh(:), ...
+        totalDailyProfileEnergy_kWh(:), ...
+        pvWindowToTotalEnergyRatio(:), ...
+        pvWindowMeanToDailyMeanRatio(:), ...
+        middayDip_kW(:), ...
+        middayDipPercent(:), ...
         offMeanDaily_kW(:), ...
-        offToProductionRatio(:), ...
+        offToNonPvPeakRatio(:), ...
+        globalPeakHour(:), ...
+        globalPeakDuringPVPeakWindow(:), ...
         selectionScore(:), ...
         'VariableNames', { ...
             'Customer', ...
             'Category', ...
+            'StrictIndustry', ...
             'ActiveDays', ...
             'AvgDailyEnergy_kWh', ...
+            'MeanPower_kW', ...
             'GlobalPeakPower_kW', ...
+            'LoadFactor', ...
+            'NightRatio', ...
+            'DaytimeRatio', ...
+            'WeekendToWeekdayRatio', ...
             'ProductionPeakDaily_kW', ...
             'ProductionMeanDaily_kW', ...
+            'NonPvPeakDaily_kW', ...
+            'NonPvPeakHour', ...
+            'PvPeakWindowMean_kW', ...
+            'PvPeakWindowPeak_kW', ...
+            'PvPeakWindowEnergy_kWh', ...
+            'TotalDailyProfileEnergy_kWh', ...
+            'PvWindowToTotalEnergyRatio', ...
+            'PvWindowMeanToDailyMeanRatio', ...
+            'MiddayDip_kW', ...
+            'MiddayDipPercent', ...
             'OffMeanDaily_kW', ...
-            'OffToProductionRatio', ...
+            'OffToNonPvPeakRatio', ...
+            'GlobalPeakHour', ...
+            'GlobalPeakDuringPVPeakWindow', ...
             'SelectionScore'});
 
-    % Eloszor csak industry + eleg hosszu + 500...1100 kW kozotti profilok.
-    candidateMask = ...
-        candidateTable.Category == "industry" & ...
-        candidateTable.ActiveDays >= minActiveDays & ...
-        candidateTable.ProductionPeakDaily_kW >= 500 & ...
-        candidateTable.ProductionPeakDaily_kW <= 1100;
+    % ---------------------------------------------------------------------
+    % 11) Jeloltek szurese - csak ipari, nincs commercial fallback
+    % ---------------------------------------------------------------------
 
-    % Ha tul szigoruek voltunk, lazitunk.
+    % Elsodleges: strict industry, legalabb 300 aktiv nap, peak >= 100 kW.
+    candidateMask = ...
+        candidateTable.StrictIndustry == true & ...
+        candidateTable.ActiveDays >= minActiveDays & ...
+        candidateTable.GlobalPeakPower_kW >= minSelectionPeak_kW & ...
+        isfinite(candidateTable.PvWindowToTotalEnergyRatio);
+
+    % Ha nincs strict industry, akkor is csak industry kategoria,
+    % commercial/residential nem megengedett.
     if ~any(candidateMask)
+        warning(['Nem talaltam strictIndustry profilt. ', ...
+                 'Csak category == "industry" profilokra lazitok, commercial/residential tovabbra sem engedett.']);
+
         candidateMask = ...
             candidateTable.Category == "industry" & ...
-            candidateTable.ActiveDays >= minActiveDays;
+            candidateTable.ActiveDays >= minActiveDays & ...
+            candidateTable.GlobalPeakPower_kW >= minSelectionPeak_kW & ...
+            isfinite(candidateTable.PvWindowToTotalEnergyRatio);
     end
 
-    % Ha meg igy sincs, akkor minden industry.
+    % Ha igy sincs, hiba.
     if ~any(candidateMask)
-        candidateMask = candidateTable.Category == "industry";
-    end
-
-    % Ha valamiert nincs industry, akkor minden ervenyes fogyasztobol valasztunk.
-    if ~any(candidateMask)
-        candidateMask = true(height(candidateTable), 1);
+        error(['Nem talaltam megfelelo ipari fogyasztasi profilt. ', ...
+               'Feltetelek: industry jelleg, legalabb %.0f aktiv nap, ', ...
+               'legalabb %.0f kW csucsteljesitmeny, ervenyes 10-14h energiaarany.'], ...
+               minActiveDays, minSelectionPeak_kW);
     end
 
     candidates = candidateTable(candidateMask, :);
-    candidates = sortrows(candidates, 'SelectionScore', 'ascend');
+
+    % Fontos:
+    %   A fo rendezesi szempont a 10-14h energia / teljes napi energia.
+    %   Masodlagos a SelectionScore.
+    candidates = sortrows(candidates, ...
+        {'PvWindowToTotalEnergyRatio', 'SelectionScore'}, ...
+        {'ascend', 'ascend'});
 
     selectedCustomer = candidates.Customer(1);
     selectedIdx = find(customerNames == selectedCustomer, 1, 'first');
 
     fprintf('\nKivalasztott fogyaszto: %s\n', selectedCustomer);
     fprintf('Kategoria: %s\n', category(selectedIdx));
+    fprintf('Strict industry: %d\n', strictIndustry(selectedIdx));
     fprintf('Aktiv napok szama: %.1f\n', activeDays(selectedIdx));
     fprintf('Atlagos napi energia: %.1f kWh/nap\n', avgDailyEnergy_kWh(selectedIdx));
-    fprintf('Uzemi napi csucs: %.1f kW\n', productionPeakDaily_kW(selectedIdx));
-    fprintf('Uzemi atlagteljesitmeny: %.1f kW\n', productionMeanDaily_kW(selectedIdx));
-    fprintf('Uzemen kivuli atlagteljesitmeny: %.1f kW\n', offMeanDaily_kW(selectedIdx));
-    fprintf('Off/production arany: %.3f\n\n', offToProductionRatio(selectedIdx));
+    fprintf('Globalis csucsteljesitmeny: %.1f kW\n', peakPower_kW(selectedIdx));
+    fprintf('Nem-PV idoszaki csucs: %.1f kW\n', nonPvPeakDaily_kW(selectedIdx));
+    fprintf('Nem-PV csucs oraja: %.2f h\n', nonPvPeakHour(selectedIdx));
+    fprintf('10-14h atlagteljesitmeny: %.1f kW\n', pvPeakWindowMean_kW(selectedIdx));
+    fprintf('10-14h energia: %.1f kWh/nap\n', pvPeakWindowEnergy_kWh(selectedIdx));
+    fprintf('Teljes napi profilenergia: %.1f kWh/nap\n', totalDailyProfileEnergy_kWh(selectedIdx));
+    fprintf('10-14h energia aranya a teljes napi fogyasztashoz kepest: %.2f %%\n', ...
+        pvWindowToTotalEnergyRatio(selectedIdx) * 100);
+    fprintf('Deli visszaeses a nem-PV csucshoz kepest: %.1f kW\n', middayDip_kW(selectedIdx));
+    fprintf('Deli visszaeses aranya: %.1f %%\n', middayDipPercent(selectedIdx) * 100);
+    fprintf('Selection score: %.4f\n\n', selectionScore(selectedIdx));
 
-    disp('Legjobb 10 jelolt:');
+    disp('Legjobb 10 ipari jelolt a 10-14h energiaarany alapjan:');
     disp(candidates(1:min(10, height(candidates)), :));
 
     % ---------------------------------------------------------------------
-    % 8) Kivalasztott fogyaszto napi atlagprofiljanak plottolasa
+    % 12) Kivalasztott fogyaszto napi atlagprofiljanak plottolasa
     % ---------------------------------------------------------------------
-    figure('Color', 'w', 'Name', 'Selected industry profile');
+    selectedProfile_kW = dailyProfiles_kW(:, selectedIdx);
+
+    fig = figure('Color', 'w', 'Name', 'Selected industry load profile');
     hold on;
     grid on;
 
-    selectedProfile_kW = dailyProfiles_kW(:, selectedIdx);
+    yLimMax = max(selectedProfile_kW, [], 'omitnan') * 1.15;
+    if isempty(yLimMax) || isnan(yLimMax) || yLimMax <= 0
+        yLimMax = 1;
+    end
 
-    plot(timeOfDayOriginal, selectedProfile_kW, 'LineWidth', 2.5);
-    yline(targetProductionPeak_kW, '--', 'Target 800 kW');
+    pvStartDur = duration(floor(pvPeakStartHour), ...
+        round((pvPeakStartHour - floor(pvPeakStartHour)) * 60), 0);
+
+    pvEndDur = duration(floor(pvPeakEndHour), ...
+        round((pvPeakEndHour - floor(pvPeakEndHour)) * 60), 0);
+
+    patch([pvStartDur pvEndDur pvEndDur pvStartDur], ...
+          [0 0 yLimMax yLimMax], ...
+          [0.90 0.90 0.90], ...
+          'EdgeColor', 'none', ...
+          'FaceAlpha', 0.35, ...
+          'DisplayName', '10-14h PV-termelesi idoszak');
+
+    plot(timeOfDayOriginal, selectedProfile_kW, ...
+        'LineWidth', 2.5, ...
+        'DisplayName', 'Atlagos napi fogyasztas');
+
+    yline(minSelectionPeak_kW, '--', ...
+        'Legalabb 100 kW csucs', ...
+        'LineWidth', 1.2, ...
+        'DisplayName', 'Minimum csucs feltetel');
+
+    ylim([0 yLimMax]);
 
     xlabel('Napon beluli ido');
     ylabel('Atlagos teljesitmeny [kW]');
-    title(sprintf('Kivalasztott industry jellegu fogyaszto: %s', selectedCustomer));
+    title(sprintf('Kivalasztott ipari fogyaszto: %s', selectedCustomer), ...
+        'Interpreter', 'none');
 
+    legend('Location', 'best');
     hold off;
 
+    saveas(fig, fullfile(savePath, 'selected_industry_profile.png'));
+    savefig(fig, fullfile(savePath, 'selected_industry_profile.fig'));
+
     % ---------------------------------------------------------------------
-    % 9) Napi .mat fajlok keszitese a kivalasztott fogyasztora
+    % 13) Napi .mat fajlok keszitese a kivalasztott fogyasztora
     % ---------------------------------------------------------------------
     fprintf('Napi .mat fajlok keszitese...\n');
 
@@ -427,7 +731,6 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
 
         pDay_kW_15min = selectedPower_kW(dayMask);
 
-        % Csak teljes 15 perces napokat mentunk.
         if numel(pDay_kW_15min) ~= samplesPerDayOriginal
             skippedDays = skippedDays + 1;
             continue;
@@ -438,12 +741,10 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
             continue;
         end
 
-        % Energia 15 perces intervallumokra [kWh]
         eDay_kWh_15min = pDay_kW_15min(:)' * dtOriginal_h;
 
         if outputResolutionMin == 30
 
-            % 15 perces energiak osszegzese 30 percre.
             eDay_kWh = eDay_kWh_15min(1:2:end) + eDay_kWh_15min(2:2:end);
             pDay_kW = eDay_kWh / dtOut_h;
 
@@ -462,7 +763,6 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
         loadPower_W = pDay_kW * 1000;
         loadEnergy_Wh = eDay_kWh * 1000;
 
-        % Nincs PV adat ebben a datasetben.
         pvPower_W = zeros(size(loadPower_W));
         pvEnergy_Wh = zeros(size(loadEnergy_Wh));
 
@@ -472,6 +772,7 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
         consumptionCache.sourceName = 'ElectricityLoadDiagrams20112014';
         consumptionCache.selectedCustomer = selectedCustomer;
         consumptionCache.selectedCategory = category(selectedIdx);
+        consumptionCache.strictIndustry = strictIndustry(selectedIdx);
 
         consumptionCache.dateString = datestr(currentDay, 'yyyy.mm.dd');
         consumptionCache.date = currentDay;
@@ -479,26 +780,22 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
         consumptionCache.dt_h = dtOut_h;
         consumptionCache.timeMinAxis = timeMinAxis;
 
-        % Ausgrid formatumhoz illeszkedo mezok
         consumptionCache.powerTotal_W = loadPower_W;
         consumptionCache.energyTotal_Wh = loadEnergy_Wh;
 
         consumptionCache.powerPV_W = pvPower_W;
         consumptionCache.energyPV_Wh = pvEnergy_Wh;
 
-        % Alternativ, egyertelmu mezok
         consumptionCache.loadPower_W = loadPower_W;
         consumptionCache.loadEnergy_Wh = loadEnergy_Wh;
         consumptionCache.pvPower_W = pvPower_W;
         consumptionCache.pvEnergy_Wh = pvEnergy_Wh;
 
-        % Napi osszesitok
         consumptionCache.totalLoadEnergy_kWh = sum(loadEnergy_Wh) / 1000;
         consumptionCache.totalPVEnergy_kWh = 0;
         consumptionCache.peakLoad_W = max(loadPower_W);
         consumptionCache.peakPV_W = 0;
 
-        % Eredeti adat informacio
         consumptionCache.originalDt_h = dtOriginal_h;
         consumptionCache.outputResolutionMin = outputResolutionMin;
         consumptionCache.originalSamplesPerDay = samplesPerDayOriginal;
@@ -506,7 +803,17 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
         consumptionCache.productionStartHour = productionStartHour;
         consumptionCache.productionEndHour = productionEndHour;
 
-        consumptionCache.averageDailyProductionPeak_kW = productionPeakDaily_kW(selectedIdx);
+        consumptionCache.pvPeakStartHour = pvPeakStartHour;
+        consumptionCache.pvPeakEndHour = pvPeakEndHour;
+
+        consumptionCache.averageDailyNonPvPeak_kW = nonPvPeakDaily_kW(selectedIdx);
+        consumptionCache.averageDailyNonPvPeakHour = nonPvPeakHour(selectedIdx);
+        consumptionCache.averageDailyPvPeakWindowMean_kW = pvPeakWindowMean_kW(selectedIdx);
+        consumptionCache.averageDailyPvPeakWindowEnergy_kWh = pvPeakWindowEnergy_kWh(selectedIdx);
+        consumptionCache.averageDailyTotalProfileEnergy_kWh = totalDailyProfileEnergy_kWh(selectedIdx);
+        consumptionCache.averageDailyPvWindowToTotalEnergyRatio = pvWindowToTotalEnergyRatio(selectedIdx);
+        consumptionCache.averageDailyMiddayDip_kW = middayDip_kW(selectedIdx);
+        consumptionCache.averageDailyMiddayDipPercent = middayDipPercent(selectedIdx);
         consumptionCache.averageDailyOffMean_kW = offMeanDaily_kW(selectedIdx);
 
         fileName = sprintf('consumption_ORIG_%s.mat', ...
@@ -520,14 +827,17 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     end
 
     % ---------------------------------------------------------------------
-    % 10) Processing summary mentese
+    % 14) Processing summary mentese
     % ---------------------------------------------------------------------
     processingSummary = struct();
 
     processingSummary.sourceFile = txtFilePath;
+    processingSummary.inputFolderPath = inputFolderPath;
     processingSummary.savePath = savePath;
+
     processingSummary.selectedCustomer = selectedCustomer;
     processingSummary.selectedCategory = category(selectedIdx);
+    processingSummary.strictIndustry = strictIndustry(selectedIdx);
 
     processingSummary.dtOriginal_h = dtOriginal_h;
     processingSummary.dtOutput_h = dtOut_h;
@@ -536,10 +846,19 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     processingSummary.totalSavedDays = totalSavedDays;
     processingSummary.skippedDays = skippedDays;
 
+    processingSummary.selectionSettings = struct();
+    processingSummary.selectionSettings.minSelectionPeak_kW = minSelectionPeak_kW;
+    processingSummary.selectionSettings.minActiveDays = minActiveDays;
+    processingSummary.selectionSettings.pvPeakStartHour = pvPeakStartHour;
+    processingSummary.selectionSettings.pvPeakEndHour = pvPeakEndHour;
+    processingSummary.selectionSettings.primaryCriterion = ...
+        'minimal 10-14h energy share relative to total daily consumption';
+
     processingSummary.candidateTable = candidateTable;
     processingSummary.bestCandidates = candidates(1:min(20, height(candidates)), :);
-
     processingSummary.selectedMetrics = candidateTable(selectedIdx, :);
+    processingSummary.selectedProfile_kW = selectedProfile_kW;
+    processingSummary.timeOfDayOriginal = timeOfDayOriginal;
 
     save(fullfile(savePath, 'electricityloaddiagrams_industry_processing_summary.mat'), ...
         'processingSummary');
@@ -549,7 +868,7 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     fprintf('Kihagyott napok szama: %d\n', skippedDays);
 
     % ---------------------------------------------------------------------
-    % 11) Kimeneti result struktura
+    % 15) Kimeneti result struktura
     % ---------------------------------------------------------------------
     result = struct();
 
@@ -557,6 +876,7 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     result.power_kW = P_kW;
     result.customerNames = customerNames;
     result.category = category;
+    result.strictIndustry = strictIndustry;
 
     result.dailyProfiles_kW = dailyProfiles_kW;
     result.timeOfDayOriginal = timeOfDayOriginal;
@@ -568,7 +888,6 @@ function result = process_load_to_structured_data(txtFilePath, savePath)
     result.selectedProfile_kW = selectedProfile_kW;
 
     result.processingSummary = processingSummary;
-
 end
 
 
@@ -577,7 +896,6 @@ end
 % =========================================================================
 
 function tempFilePath = local_create_decimal_dot_copy(inputFilePath)
-% Letrehoz egy ideiglenes fajlt, ahol a decimalis vesszok pontok.
 
     [~, fileName, fileExt] = fileparts(char(inputFilePath));
 
@@ -610,27 +928,22 @@ function tempFilePath = local_create_decimal_dot_copy(inputFilePath)
 
         line = strrep(line, ',', '.');
         fprintf(fout, '%s\n', line);
-
     end
 
     fclose(fin);
     fclose(fout);
-
 end
 
 
 function local_delete_temp_file(tempFilePath)
-% Ideiglenes fajl torlese.
 
     if isfile(tempFilePath)
         delete(tempFilePath);
     end
-
 end
 
 
 function avgProfile = local_average_daily_profile(time, p, samplesPerDay)
-% Atlagos napi profil szamitasa teljes napokbol.
 
     datesOnly = dateshift(time, 'start', 'day');
     uniqueDays = unique(datesOnly);
@@ -651,19 +964,13 @@ function avgProfile = local_average_daily_profile(time, p, samplesPerDay)
         end
 
         profiles(:, d) = pDay(:);
-
     end
 
     avgProfile = mean(profiles, 2, 'omitnan');
-
 end
 
 
 function q = local_percentile(x, p)
-% Toolbox fuggetlen percentilis szamitas.
-%
-% x : vektor
-% p : percentilis 0...100 kozott
 
     x = x(:);
     x = x(~isnan(x));
@@ -690,5 +997,14 @@ function q = local_percentile(x, p)
         w = pos - lo;
         q = (1 - w) * x(lo) + w * x(hi);
     end
+end
 
+
+function y = local_safe_divide(a, b)
+
+    if isempty(b) || isnan(b) || abs(b) < 1e-12
+        y = NaN;
+    else
+        y = a / b;
+    end
 end

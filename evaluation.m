@@ -1,293 +1,522 @@
-function evaluationResult = evaluation(cfg)
+function evaluationResult = evaluation(cfg, evalCfg)
 % EVALUATION
 %
-% Grid-connected PV+BESS self-consumption szimulacios eredmenyek
-% kiertekelese.
+% Grid-connected PV+BESS onfogyasztás-növelési eredmények kiértékelése.
 %
-% A fuggveny alapertelmezetten ezt tolti be:
+% Bemenet:
+%   cfg     : fő szimulációs konfiguráció
+%   evalCfg : külön kiértékelési konfiguráció
 %
-%   cfg.paths.results/results_dccoupled.mat
+% Kötelező evalCfg mezők:
 %
-% A fajlban egy DB struktura kell legyen:
+%   evalCfg.input.resultFilePath
+%   evalCfg.output.baseFolder
+%   evalCfg.output.saveEvaluationMat
+%   evalCfg.output.saveEvaluationCsv
+%   evalCfg.output.saveReportTables
 %
-%   DB.candidateTable
-%   DB.candidateProfiles
-%   DB.nDays
-%   DB.dt_h
+%   evalCfg.plots.makePlots
+%   evalCfg.plots.make3DScatter
+%   evalCfg.plots.showAllMetrics
 %
-% Kiertekelt mutatok:
-%   - grid import reduction [%]
-%   - self-consumption [%]
-%   - self-sufficiency [%]
-%   - curtailment [%]
-%   - LCSE / LCOE_saved [HUF/kWh_saved]
-%   - discounted payback [year]
-%   - NPV [HUF]
-%   - period net value [HUF]
+%   evalCfg.selection.mode
+%   evalCfg.selection.minGridImportReduction_pct
+%   evalCfg.selection.requirePositiveNPV
+%   evalCfg.selection.requireBESS
 %
-% Abra:
-%   - 3D scatter plot minden fontos mutatora:
-%       x = P_inv_kW
-%       y = P_PV_kW
-%       z = E_BESS_kWh
+%   evalCfg.report.smallBessMaxRatio
+%   evalCfg.report.largeBessMinRatio
 %
-%   - inverterenkenti heatmap:
-%       x = DCAC_ratio
-%       y = BESS_PV_ratio
-%       color = adott mutato
+%   evalCfg.economics.simYears
+%   evalCfg.economics.projectLifetime_years
+%   evalCfg.economics.pvLifetime_years
+%   evalCfg.economics.inverterLifetime_years
+%   evalCfg.economics.discountRate
+%   evalCfg.economics.pv_opex_frac_per_year
+%   evalCfg.economics.bess_opex_frac_per_year
+%   evalCfg.economics.inverter_opex_frac_per_year
 %
-% Fontos:
-%   A heatmapek ugyanazon metrika eseten kozos color range-et hasznalnak,
-%   hogy az invertermeretek osszehasonlithatok legyenek.
+%   evalCfg.metrics(:).field
+%   evalCfg.metrics(:).label
+%   evalCfg.metrics(:).unit
+%   evalCfg.metrics(:).direction
+%   evalCfg.metrics(:).plotWhenCompact
 %
-% Legjobb candidate kivalasztasa:
-%   cfg.evaluation.selectionMode:
-%       "minLCSE"    -> legalacsonyabb fajlagos megtakaritottenergia-koltseg
-%       "maxNPV"     -> legnagyobb netto jelenertek
-%       "minPayback" -> legrovidebb diszkontalt megterules
+% Kötelező cfg mezők:
 %
-% A BESS degradacios koltseghez szukseges:
-%   DB.candidateTable.finalSoH
+%   cfg.cost.pv_huf_per_kWp
+%   cfg.cost.bess_huf_per_kWh
+%   cfg.cost.bess_power_huf_per_kW
+%   cfg.cost.inverter_huf_per_kW
+%   cfg.cost.grid_import_huf_per_kWh
+%   cfg.grid.allowExport
+%
+% Ha cfg.grid.allowExport == true:
+%   cfg.cost.grid_export_huf_per_kWh
+%
+% Fő kimenetek:
+%   evaluationResult.resultTable
+%   evaluationResult.reportTables.optimalSystemTable
+%   evaluationResult.reportTables.lcseMatrixTable
+%   evaluationResult.reportTables.npvMatrixTable
+%   evaluationResult.best
+%
+% Ábrák:
+%   - LCSE színezett táblázat
+%   - NPV színezett táblázat
+%   - opcionális 3D scatter ábrák evalCfg.metrics alapján
+%
+% Színezés:
+%   - zöld: legjobb érték
+%   - sárga: köztes érték
+%   - piros: legrosszabb érték
+%
+% A direction dönti el az irányt:
+%   "max" -> nagyobb érték jobb
+%   "min" -> kisebb érték jobb
 
     % ---------------------------------------------------------------------
-    % 0) Alap ellenorzesek es utak
+    % 0) Validálás
     % ---------------------------------------------------------------------
-    if nargin < 1
-        error('A cfg struktura kotelezo bemenet.');
+    if nargin < 2
+        error(['Az evaluation(cfg, evalCfg) forma kötelező. ', ...
+               'Hozd létre az evalCfg struktúrát külön create_evaluation_config(cfg) függvénnyel.']);
     end
 
-    if ~isfield(cfg, 'paths') || ~isfield(cfg.paths, 'results')
-        error('cfg.paths.results hianyzik.');
-    end
+    local_validate_cfg(cfg);
+    local_validate_eval_cfg(evalCfg);
 
-    if ~isfield(cfg.paths, 'figures')
-        cfg.paths.figures = fullfile(cfg.paths.results, 'figures');
-    end
+    resultFilePath = char(evalCfg.input.resultFilePath);
+    savePath = char(evalCfg.output.baseFolder);
 
-    if ~isfolder(cfg.paths.results)
-        error('Nem letezik a results mappa: %s', cfg.paths.results);
+    if ~isfile(resultFilePath)
+        error('Nem található az evaluation input fájl: %s', resultFilePath);
     end
-
-    if ~isfolder(cfg.paths.figures)
-        mkdir(cfg.paths.figures);
-    end
-
-    savePath = fullfile(cfg.paths.figures, 'evaluation');
 
     if ~isfolder(savePath)
         mkdir(savePath);
     end
 
-    resultFileName = string(local_get_cfg_value( ...
-        cfg, {'evaluation', 'resultFileName'}, "results_dccoupled.mat"));
-
-    resultFilePath = fullfile(cfg.paths.results, char(resultFileName));
-
-    if ~isfile(resultFilePath)
-        error('Nem talalhato eredmenyfajl: %s', resultFilePath);
-    end
-
-    fprintf('Evaluation input file: %s\n', resultFilePath);
-    fprintf('Figures/evaluation output path: %s\n\n', savePath);
+    fprintf('Kiértékelés input fájl: %s\n', resultFilePath);
+    fprintf('Kiértékelés mentési mappa: %s\n\n', savePath);
 
     % ---------------------------------------------------------------------
-    % 1) DB betoltese
+    % 1) DB betöltése
     % ---------------------------------------------------------------------
     S = load(resultFilePath);
     DB = local_find_db_struct(S);
 
     if ~isfield(DB, 'candidateTable')
-        error('A betoltott DB nem tartalmaz candidateTable mezot.');
+        error('A betöltött DB nem tartalmaz candidateTable mezőt.');
     end
 
     T = DB.candidateTable;
 
-    nCandidates = height(T);
-
-    if nCandidates == 0
-        error('A candidateTable ures.');
-    end
-
-    if isfield(DB, 'nDays')
-        nDays = DB.nDays;
-    else
-        nDays = NaN;
-    end
-
-    if isfield(DB, 'dt_h')
-        dt_h = DB.dt_h;
-    else
-        dt_h = NaN;
+    if height(T) == 0
+        error('A candidateTable üres.');
     end
 
     % ---------------------------------------------------------------------
-    % 2) Candidate meretek es dimenziok kiolvasasa
+    % 2) Teljes kiértékelési eredménytábla
     % ---------------------------------------------------------------------
-    candidateIndex = local_get_numeric_column(T, {'candidateIndex'}, (1:nCandidates).');
-
-    P_inv_kW = local_get_numeric_column(T, {'P_inv_kW'}, NaN(nCandidates, 1));
-    P_PV_kW  = local_get_numeric_column(T, {'P_PV_kW', 'PV_kW'}, NaN(nCandidates, 1));
-    E_BESS_kWh = local_get_numeric_column(T, {'E_BESS_kWh'}, NaN(nCandidates, 1));
-    P_BESS_kW  = local_get_numeric_column(T, {'P_BESS_kW'}, NaN(nCandidates, 1));
-
-    DCAC_ratio = local_get_numeric_column(T, {'DCAC_ratio'}, NaN(nCandidates, 1));
-    BESS_PV_ratio = local_get_numeric_column(T, {'BESS_PV_ratio'}, NaN(nCandidates, 1));
-
-    missingDCAC = isnan(DCAC_ratio) & P_inv_kW > 0;
-    DCAC_ratio(missingDCAC) = P_PV_kW(missingDCAC) ./ P_inv_kW(missingDCAC);
-
-    missingBessPv = isnan(BESS_PV_ratio) & P_PV_kW > 0;
-    BESS_PV_ratio(missingBessPv) = E_BESS_kWh(missingBessPv) ./ P_PV_kW(missingBessPv);
+    resultTable = local_build_result_table(T, cfg, evalCfg);
 
     % ---------------------------------------------------------------------
-    % 3) Alap energiaaramok kiolvasasa
+    % 3) Legjobb jelöltek kiválasztása
     % ---------------------------------------------------------------------
-    loadEnergy_kWh = local_get_numeric_column(T, ...
-        {'loadEnergy_kWh'}, NaN(nCandidates, 1));
+    best = struct();
 
-    pvEnergyAvailable_kWh = local_get_numeric_column(T, ...
-        {'pvEnergyAvailable_kWh', 'pvEnergy_kWh'}, NaN(nCandidates, 1));
+    best.overallIndex = local_select_best_candidate(resultTable, evalCfg, true(height(resultTable), 1));
 
-    pvToLoad_kWh = local_get_numeric_column(T, ...
-        {'pvToLoad_kWh'}, zeros(nCandidates, 1));
+    pvOnlyMask = resultTable.E_BESS_kWh <= 1e-9;
 
-    pvToBess_kWh = local_get_numeric_column(T, ...
-        {'pvToBess_kWh'}, zeros(nCandidates, 1));
+    smallBessMask = ...
+        resultTable.E_BESS_kWh > 1e-9 & ...
+        resultTable.BESS_PV_ratio <= evalCfg.report.smallBessMaxRatio;
 
-    bessToLoad_kWh = local_get_numeric_column(T, ...
-        {'bessToLoad_kWh'}, zeros(nCandidates, 1));
+    largeBessMask = ...
+        resultTable.E_BESS_kWh > 1e-9 & ...
+        resultTable.BESS_PV_ratio >= evalCfg.report.largeBessMinRatio;
 
-    gridImport_kWh = local_get_numeric_column(T, ...
-        {'gridImport_kWh'}, NaN(nCandidates, 1));
+    best.pvOnlyIndex = local_select_best_candidate(resultTable, evalCfg, pvOnlyMask);
+    best.smallBessIndex = local_select_best_candidate(resultTable, evalCfg, smallBessMask);
+    best.largeBessIndex = local_select_best_candidate(resultTable, evalCfg, largeBessMask);
 
-    gridExport_kWh = local_get_numeric_column(T, ...
-        {'gridExport_kWh'}, zeros(nCandidates, 1));
+    best.indices = [ ...
+        best.pvOnlyIndex, ...
+        best.smallBessIndex, ...
+        best.largeBessIndex];
 
-    curtailment_kWh = local_get_numeric_column(T, ...
-        {'curtailment_kWh'}, zeros(nCandidates, 1));
+    best.names = [ ...
+        "Csak napelem", ...
+        "Napelem + akkumulátor (1)", ...
+        "Napelem + akkumulátor (2)"];
 
-    inverterLoss_kWh = local_get_numeric_column(T, ...
-        {'inverterLoss_kWh'}, zeros(nCandidates, 1));
+    fprintf('Kiválasztási mód: %s\n', string(evalCfg.selection.mode));
+    fprintf('Összesített legjobb candidate index: %d\n\n', best.overallIndex);
 
-    internalNetworkLoss_kWh = local_get_numeric_column(T, ...
-        {'internalNetworkLoss_kWh'}, zeros(nCandidates, 1));
+    fprintf('Riportba kerülő jelöltek:\n');
+    for k = 1:numel(best.indices)
+        idx = best.indices(k);
+        fprintf('  %s: candidateIndex = %d, P_inv = %.1f kW, P_PV = %.1f kWp, E_BESS = %.1f kWh\n', ...
+            best.names(k), ...
+            resultTable.candidateIndex(idx), ...
+            resultTable.P_inv_kW(idx), ...
+            resultTable.P_PV_kW(idx), ...
+            resultTable.E_BESS_kWh(idx));
+    end
+    fprintf('\n');
 
     % ---------------------------------------------------------------------
-    % 4) Vegso SoH
+    % 4) Riporttáblázatok
     % ---------------------------------------------------------------------
-    finalSoH = local_get_final_soh(T, DB, nCandidates);
+    reportTables = struct();
 
-    noBessMask = E_BESS_kWh <= 1e-9 | isnan(E_BESS_kWh);
-    finalSoH(noBessMask) = 1;
+    reportTables.optimalSystemTable = local_create_optimal_system_table( ...
+        resultTable, best.indices, best.names);
+
+    [reportTables.lcseMatrixTable, lcseMatrixData] = local_create_metric_matrix_table( ...
+        resultTable, ...
+        "LCSE_HUF_per_kWh_saved", ...
+        "min");
+
+    [reportTables.npvMatrixTable, npvMatrixData] = local_create_metric_matrix_table( ...
+        resultTable, ...
+        "NPV_millionHUF", ...
+        "max");
 
     % ---------------------------------------------------------------------
-    % 5) Muszaki szarmaztatott mutatok
+    % 5) Ábrák
     % ---------------------------------------------------------------------
-    gridImportReduction_kWh = max(loadEnergy_kWh - gridImport_kWh, 0);
+    if evalCfg.plots.makePlots
+
+        % Kötelező színezett táblázatos ábrák: LCSE és NPV
+        local_plot_colored_matrix_table( ...
+            lcseMatrixData, ...
+            'LCSE - megtakarított energia fajlagos költsége', ...
+            'Ft/kWh', ...
+            'min', ...
+            savePath, ...
+            'colored_table_lcse');
+
+        local_plot_colored_matrix_table( ...
+            npvMatrixData, ...
+            'Nettó jelenérték', ...
+            'millió Ft', ...
+            'max', ...
+            savePath, ...
+            'colored_table_npv');
+
+        % Opcionális 3D scatter ábrák
+        if evalCfg.plots.make3DScatter
+            local_plot_selected_3d_scatters(resultTable, evalCfg, best.overallIndex, savePath);
+        end
+    end
+
+    % ---------------------------------------------------------------------
+    % 6) Mentés
+    % ---------------------------------------------------------------------
+    evaluationResult = struct();
+
+    evaluationResult.config = cfg;
+    evaluationResult.evalCfg = evalCfg;
+    evaluationResult.sourceFile = resultFilePath;
+    evaluationResult.resultTable = resultTable;
+    evaluationResult.best = best;
+    evaluationResult.bestCandidate = resultTable(best.overallIndex, :);
+    evaluationResult.reportTables = reportTables;
+
+    if evalCfg.output.saveEvaluationMat
+        save(fullfile(savePath, 'evaluation_result.mat'), 'evaluationResult');
+    end
+
+    if evalCfg.output.saveEvaluationCsv
+        local_safe_writetable(resultTable, fullfile(savePath, 'evaluation_result_table.csv'));
+    end
+
+    if evalCfg.output.saveReportTables
+        local_safe_writetable(reportTables.optimalSystemTable, ...
+            fullfile(savePath, 'optimalis_rendszermeretek_tablazat.csv'));
+
+        local_safe_writetable(reportTables.lcseMatrixTable, ...
+            fullfile(savePath, 'lcse_szinezett_matrix_tablazat.csv'));
+
+        local_safe_writetable(reportTables.npvMatrixTable, ...
+            fullfile(savePath, 'npv_szinezett_matrix_tablazat.csv'));
+
+        save(fullfile(savePath, 'report_tables.mat'), 'reportTables');
+    end
+
+    fprintf('Kiértékelés kész.\n');
+    fprintf('Mentési mappa: %s\n', savePath);
+end
+
+
+% =========================================================================
+% VALIDÁLÁS
+% =========================================================================
+function local_validate_cfg(cfg)
+
+    local_require_fields(cfg, {'cost', 'grid'}, 'cfg');
+
+    requiredCostFields = { ...
+        'pv_huf_per_kWp', ...
+        'bess_huf_per_kWh', ...
+        'bess_power_huf_per_kW', ...
+        'inverter_huf_per_kW', ...
+        'grid_import_huf_per_kWh'};
+
+    local_require_fields(cfg.cost, requiredCostFields, 'cfg.cost');
+
+    local_require_fields(cfg.grid, {'allowExport'}, 'cfg.grid');
+
+    if logical(cfg.grid.allowExport)
+        local_require_fields(cfg.cost, {'grid_export_huf_per_kWh'}, 'cfg.cost');
+    end
+end
+
+
+function local_validate_eval_cfg(evalCfg)
+
+    local_require_fields(evalCfg, ...
+        {'input', 'output', 'plots', 'selection', 'report', 'economics', 'metrics'}, ...
+        'evalCfg');
+
+    local_require_fields(evalCfg.input, ...
+        {'resultFilePath'}, ...
+        'evalCfg.input');
+
+    local_require_fields(evalCfg.output, ...
+        {'baseFolder', 'saveEvaluationMat', 'saveEvaluationCsv', 'saveReportTables'}, ...
+        'evalCfg.output');
+
+    local_require_fields(evalCfg.plots, ...
+        {'makePlots', 'make3DScatter', 'showAllMetrics'}, ...
+        'evalCfg.plots');
+
+    local_require_fields(evalCfg.selection, ...
+        {'mode', 'minGridImportReduction_pct', 'requirePositiveNPV', 'requireBESS'}, ...
+        'evalCfg.selection');
+
+    local_require_fields(evalCfg.report, ...
+        {'smallBessMaxRatio', 'largeBessMinRatio'}, ...
+        'evalCfg.report');
+
+    local_require_fields(evalCfg.economics, ...
+        {'simYears', ...
+         'projectLifetime_years', ...
+         'pvLifetime_years', ...
+         'inverterLifetime_years', ...
+         'discountRate', ...
+         'pv_opex_frac_per_year', ...
+         'bess_opex_frac_per_year', ...
+         'inverter_opex_frac_per_year'}, ...
+        'evalCfg.economics');
+
+    if isempty(evalCfg.metrics)
+        error('evalCfg.metrics üres.');
+    end
+
+    local_require_fields(evalCfg.metrics, ...
+        {'field', 'label', 'unit', 'direction', 'plotWhenCompact'}, ...
+        'evalCfg.metrics');
+
+    for i = 1:numel(evalCfg.metrics)
+        direction = string(evalCfg.metrics(i).direction);
+
+        if ~(direction == "min" || direction == "max")
+            error('Hibás evalCfg.metrics(%d).direction: %s. Használható: "min" vagy "max".', ...
+                i, direction);
+        end
+    end
+end
+
+
+function local_require_fields(S, requiredFields, structName)
+
+    for i = 1:numel(requiredFields)
+        f = requiredFields{i};
+
+        if ~isfield(S, f)
+            error('Hiányzó kötelező mező: %s.%s', structName, f);
+        end
+    end
+end
+
+
+% =========================================================================
+% DB BETÖLTÉS
+% =========================================================================
+function DB = local_find_db_struct(S)
+
+    if isfield(S, 'DB')
+        DB = S.DB;
+        return;
+    end
+
+    names = fieldnames(S);
+
+    for i = 1:numel(names)
+        candidate = S.(names{i});
+
+        if isstruct(candidate) && isfield(candidate, 'candidateTable')
+            DB = candidate;
+            return;
+        end
+    end
+
+    error('Nem találtam DB struktúrát a MAT fájlban.');
+end
+
+
+% =========================================================================
+% RESULT TABLE ÉPÍTÉS
+% =========================================================================
+function resultTable = local_build_result_table(T, cfg, evalCfg)
+
+    n = height(T);
+
+    % ---------------------------------------------------------------------
+    % Candidate méretek
+    % ---------------------------------------------------------------------
+    candidateIndex = local_get_required_column(T, {'candidateIndex'});
+    P_inv_kW = local_get_required_column(T, {'P_inv_kW'});
+    P_PV_kW = local_get_required_column(T, {'P_PV_kW', 'PV_kW'});
+    E_BESS_kWh = local_get_required_column(T, {'E_BESS_kWh'});
+    P_BESS_kW = local_get_required_column(T, {'P_BESS_kW'});
+
+    DCAC_ratio = local_get_required_column(T, {'DCAC_ratio'});
+    BESS_PV_ratio = local_get_required_column(T, {'BESS_PV_ratio'});
+
+    % ---------------------------------------------------------------------
+    % Energiaáramok
+    % ---------------------------------------------------------------------
+    loadEnergy_kWh = local_get_required_column(T, {'loadEnergy_kWh'});
+
+    pvEnergyAvailable_kWh = local_get_required_column(T, { ...
+        'pvEnergyAvailable_kWh', ...
+        'pvEnergy_kWh'});
+
+    pvToLoad_kWh = local_get_required_column(T, {'pvToLoad_kWh'});
+    pvToBess_kWh = local_get_required_column(T, {'pvToBess_kWh'});
+    bessToLoad_kWh = local_get_required_column(T, {'bessToLoad_kWh'});
+
+    gridImport_kWh = local_get_required_column(T, {'gridImport_kWh'});
+    gridExport_kWh = local_get_required_column(T, {'gridExport_kWh'});
+    curtailment_kWh = local_get_required_column(T, {'curtailment_kWh'});
+
+    inverterLoss_kWh = local_get_required_column(T, {'inverterLoss_kWh'});
+    internalNetworkLoss_kWh = local_get_required_column(T, {'internalNetworkLoss_kWh'});
+
+    % ---------------------------------------------------------------------
+    % Veszteségmezők, ha a cfg.output alapján már kimentésre kerültek
+    % ---------------------------------------------------------------------
+    bessCellLoss_kWh = local_get_required_column(T, {'bessCellLoss_kWh'});
+    bessTotalInternalLoss_kWh = local_get_required_column(T, {'bessTotalInternalLoss_kWh'});
+    dcdcConversionLoss_kWh = local_get_required_column(T, {'dcdcConversionLoss_kWh'});
+    inverterConversionLoss_kWh = local_get_required_column(T, {'inverterConversionLoss_kWh'});
+    inverterPowerClipped_kWh = local_get_required_column(T, {'inverterPowerClipped_kWh'});
+    inverterPvClipped_kWh = local_get_required_column(T, {'inverterPvClipped_kWh'});
+    inverterBessClipped_kWh = local_get_required_column(T, {'inverterBessClipped_kWh'});
+
+    % ---------------------------------------------------------------------
+    % Final SoH
+    % ---------------------------------------------------------------------
+    finalSoH = local_get_required_final_soh(T, E_BESS_kWh);
+
+    % ---------------------------------------------------------------------
+    % Származtatott műszaki mutatók
+    % ---------------------------------------------------------------------
+    gridImportReduction_kWh = loadEnergy_kWh - gridImport_kWh;
+    gridImportReduction_kWh(gridImportReduction_kWh < 0) = 0;
 
     gridImportReduction_pct = ...
-        100 * local_safe_divide_vec(gridImportReduction_kWh, loadEnergy_kWh);
+        100 * local_divide_required(gridImportReduction_kWh, loadEnergy_kWh, ...
+        'gridImportReduction_pct');
 
     pvSelfConsumedGross_kWh = pvToLoad_kWh + pvToBess_kWh;
     pvSelfConsumedUseful_kWh = pvToLoad_kWh + bessToLoad_kWh;
 
     directSelfConsumption_pct = ...
-        100 * local_safe_divide_vec(pvToLoad_kWh, pvEnergyAvailable_kWh);
-
-    selfConsumption_pct = ...
-        100 * local_safe_divide_vec(pvSelfConsumedUseful_kWh, pvEnergyAvailable_kWh);
+        100 * local_divide_required(pvToLoad_kWh, pvEnergyAvailable_kWh, ...
+        'directSelfConsumption_pct');
 
     selfConsumptionGross_pct = ...
-        100 * local_safe_divide_vec(pvSelfConsumedGross_kWh, pvEnergyAvailable_kWh);
+        100 * local_divide_required(pvSelfConsumedGross_kWh, pvEnergyAvailable_kWh, ...
+        'selfConsumptionGross_pct');
+
+    selfConsumption_pct = ...
+        100 * local_divide_required(pvSelfConsumedUseful_kWh, pvEnergyAvailable_kWh, ...
+        'selfConsumption_pct');
 
     selfSufficiency_pct = ...
-        100 * local_safe_divide_vec(pvSelfConsumedUseful_kWh, loadEnergy_kWh);
+        100 * local_divide_required(pvSelfConsumedUseful_kWh, loadEnergy_kWh, ...
+        'selfSufficiency_pct');
 
     curtailment_pct = ...
-        100 * local_safe_divide_vec(curtailment_kWh, pvEnergyAvailable_kWh);
+        100 * local_divide_required(curtailment_kWh, pvEnergyAvailable_kWh, ...
+        'curtailment_pct');
 
     gridExport_pct = ...
-        100 * local_safe_divide_vec(gridExport_kWh, pvEnergyAvailable_kWh);
+        100 * local_divide_required(gridExport_kWh, pvEnergyAvailable_kWh, ...
+        'gridExport_pct');
+
+    unusedPV_kWh = curtailment_kWh + gridExport_kWh;
+
+    unusedPV_pct = ...
+        100 * local_divide_required(unusedPV_kWh, pvEnergyAvailable_kWh, ...
+        'unusedPV_pct');
 
     bessEquivalentCycles = ...
-        local_safe_divide_vec(pvToBess_kWh + bessToLoad_kWh, 2 * E_BESS_kWh);
+        local_divide_required(pvToBess_kWh + bessToLoad_kWh, 2 * E_BESS_kWh, ...
+        'bessEquivalentCycles');
 
+    noBessMask = E_BESS_kWh <= 1e-9;
     bessEquivalentCycles(noBessMask) = 0;
 
     % ---------------------------------------------------------------------
-    % 6) Gazdasagi beallitasok
+    % Gazdasági paraméterek
     % ---------------------------------------------------------------------
-    simYears = local_get_first_cfg_value(cfg, { ...
-        {'evaluation', 'simYears'}, ...
-        {'analysis', 'simYears'}, ...
-        {'sim', 'simYears'}}, NaN);
+    simYears = evalCfg.economics.simYears;
+    projectLifetime_years = evalCfg.economics.projectLifetime_years;
+    pvLifetime_years = evalCfg.economics.pvLifetime_years;
+    inverterLifetime_years = evalCfg.economics.inverterLifetime_years;
+    discountRate = evalCfg.economics.discountRate;
 
-    if isnan(simYears)
-        if ~isnan(nDays)
-            simYears = nDays / 365.25;
-        else
-            simYears = 1;
-        end
+    pv_opex_frac_per_year = evalCfg.economics.pv_opex_frac_per_year;
+    bess_opex_frac_per_year = evalCfg.economics.bess_opex_frac_per_year;
+    inverter_opex_frac_per_year = evalCfg.economics.inverter_opex_frac_per_year;
+
+    pv_huf_per_kWp = cfg.cost.pv_huf_per_kWp;
+    bess_huf_per_kWh = cfg.cost.bess_huf_per_kWh;
+    bess_power_huf_per_kW = cfg.cost.bess_power_huf_per_kW;
+    inverter_huf_per_kW = cfg.cost.inverter_huf_per_kW;
+    grid_import_huf_per_kWh = cfg.cost.grid_import_huf_per_kWh;
+
+    if logical(cfg.grid.allowExport)
+        grid_export_huf_per_kWh = cfg.cost.grid_export_huf_per_kWh;
+    else
+        grid_export_huf_per_kWh = 0;
     end
 
-    projectLifetime_years = local_get_first_cfg_value(cfg, { ...
-        {'cost', 'project_lifetime_years'}, ...
-        {'economic', 'projectLifetime_years'}}, 20);
-
-    pvLifetime_years = local_get_first_cfg_value(cfg, { ...
-        {'cost', 'pv_lifetime_years'}, ...
-        {'economic', 'pvLifetime_years'}}, 25);
-
-    inverterLifetime_years = local_get_first_cfg_value(cfg, { ...
-        {'cost', 'inverter_lifetime_years'}, ...
-        {'economic', 'inverterLifetime_years'}}, 15);
-
-    discountRate = local_get_first_cfg_value(cfg, { ...
-        {'cost', 'discount_rate'}, ...
-        {'economic', 'discountRate'}}, 0.08);
-
-    pv_huf_per_kWp = local_get_cfg_value(cfg, ...
-        {'cost', 'pv_huf_per_kWp'}, 0);
-
-    bess_huf_per_kWh = local_get_cfg_value(cfg, ...
-        {'cost', 'bess_huf_per_kWh'}, 0);
-
-    bess_power_huf_per_kW = local_get_cfg_value(cfg, ...
-        {'cost', 'bess_power_huf_per_kW'}, 0);
-
-    inverter_huf_per_kW = local_get_cfg_value(cfg, ...
-        {'cost', 'inverter_huf_per_kW'}, 0);
-
-    grid_import_huf_per_kWh = local_get_cfg_value(cfg, ...
-        {'cost', 'grid_import_huf_per_kWh'}, 0);
-
-    grid_export_huf_per_kWh = local_get_cfg_value(cfg, ...
-        {'cost', 'grid_export_huf_per_kWh'}, 0);
-
-    pv_opex_frac_per_year = local_get_cfg_value(cfg, ...
-        {'cost', 'pv_opex_frac_per_year'}, 0.015);
-
-    bess_opex_frac_per_year = local_get_cfg_value(cfg, ...
-        {'cost', 'bess_opex_frac_per_year'}, 0.020);
-
-    inverter_opex_frac_per_year = local_get_cfg_value(cfg, ...
-        {'cost', 'inverter_opex_frac_per_year'}, 0.010);
-
     % ---------------------------------------------------------------------
-    % 7) CAPEX, OPEX, degradacios koltseg
+    % CAPEX
     % ---------------------------------------------------------------------
     capexPV_HUF = P_PV_kW .* pv_huf_per_kWp;
 
     capexBESS_energy_HUF = E_BESS_kWh .* bess_huf_per_kWh;
-    capexBESS_power_HUF  = P_BESS_kW .* bess_power_huf_per_kW;
+    capexBESS_power_HUF = P_BESS_kW .* bess_power_huf_per_kW;
     capexBESS_HUF = capexBESS_energy_HUF + capexBESS_power_HUF;
 
     capexInverter_HUF = P_inv_kW .* inverter_huf_per_kW;
 
-    initialCapex_HUF = capexPV_HUF + capexBESS_HUF + capexInverter_HUF;
+    initialCapex_HUF = ...
+        capexPV_HUF + ...
+        capexBESS_HUF + ...
+        capexInverter_HUF;
 
     % ---------------------------------------------------------------------
-    % A szimulalt idoszakra allokalt CAPEX
+    % Szimulált időszakra allokált költségek
     % ---------------------------------------------------------------------
     allocatedPVCapex_HUF = ...
         min(simYears / pvLifetime_years, 1) .* capexPV_HUF;
@@ -298,14 +527,14 @@ function evaluationResult = evaluation(cfg)
     allocatedInverterCapex_HUF = ...
         min(simYears / inverterLifetime_years, 1) .* capexInverter_HUF;
 
-    % ---------------------------------------------------------------------
-    % OPEX a szimulalt idoszakra
-    % ---------------------------------------------------------------------
     opexPV_HUF = capexPV_HUF .* pv_opex_frac_per_year .* simYears;
     opexBESS_HUF = capexBESS_HUF .* bess_opex_frac_per_year .* simYears;
     opexInverter_HUF = capexInverter_HUF .* inverter_opex_frac_per_year .* simYears;
 
-    totalOpex_HUF = opexPV_HUF + opexBESS_HUF + opexInverter_HUF;
+    totalOpex_HUF = ...
+        opexPV_HUF + ...
+        opexBESS_HUF + ...
+        opexInverter_HUF;
 
     allocatedTotalCost_HUF = ...
         allocatedPVCapex_HUF + ...
@@ -314,7 +543,7 @@ function evaluationResult = evaluation(cfg)
         totalOpex_HUF;
 
     % ---------------------------------------------------------------------
-    % 8) Energia koltseg es megtakaritas
+    % Energia-költségek
     % ---------------------------------------------------------------------
     gridOnlyEnergyCost_HUF = ...
         loadEnergy_kWh .* grid_import_huf_per_kWh;
@@ -334,29 +563,36 @@ function evaluationResult = evaluation(cfg)
     periodNetValue_HUF = ...
         energyCostSavings_HUF - allocatedTotalCost_HUF;
 
-    % LCSE = Levelized Cost of Saved Energy
-    LCOE_saved_HUF_per_kWh = ...
-        local_safe_divide_vec(allocatedTotalCost_HUF, gridImportReduction_kWh);
+    annualEnergySavings_HUF = energyCostSavings_HUF ./ simYears;
+    annualOpex_HUF = totalOpex_HUF ./ simYears;
 
-    % ---------------------------------------------------------------------
-    % 9) Discounted cashflow mutatok
-    % ---------------------------------------------------------------------
-    annualEnergySavings_HUF = energyCostSavings_HUF ./ max(simYears, eps);
-    annualOpex_HUF = totalOpex_HUF ./ max(simYears, eps);
-
-    % Itt a degradacios koltseget evesitve kezeljuk a cashflow-ban.
     annualBessDegradationCost_HUF = ...
-        allocatedBESSDegradationCapex_HUF ./ max(simYears, eps);
+        allocatedBESSDegradationCapex_HUF ./ simYears;
 
     annualNetCashflow_HUF = ...
         annualEnergySavings_HUF - ...
         annualOpex_HUF - ...
         annualBessDegradationCost_HUF;
 
-    NPV_HUF = NaN(nCandidates, 1);
-    discountedPayback_year = NaN(nCandidates, 1);
+    % ---------------------------------------------------------------------
+    % Fajlagos költségmutatók
+    % ---------------------------------------------------------------------
+    LCSE_HUF_per_kWh_saved = ...
+        local_divide_required(allocatedTotalCost_HUF, gridImportReduction_kWh, ...
+        'LCSE_HUF_per_kWh_saved');
 
-    for i = 1:nCandidates
+    LCOE_usefulPV_HUF_per_kWh = ...
+        local_divide_required(allocatedTotalCost_HUF, pvSelfConsumedUseful_kWh, ...
+        'LCOE_usefulPV_HUF_per_kWh');
+
+    % ---------------------------------------------------------------------
+    % Cashflow mutatók
+    % ---------------------------------------------------------------------
+    NPV_HUF = NaN(n, 1);
+    discountedPayback_year = NaN(n, 1);
+    simplePayback_year = NaN(n, 1);
+
+    for i = 1:n
         NPV_HUF(i) = local_npv_constant_cashflow( ...
             initialCapex_HUF(i), ...
             annualNetCashflow_HUF(i), ...
@@ -368,14 +604,33 @@ function evaluationResult = evaluation(cfg)
             annualNetCashflow_HUF(i), ...
             discountRate, ...
             projectLifetime_years);
+
+        if annualNetCashflow_HUF(i) > 0
+            simplePayback_year(i) = initialCapex_HUF(i) / annualNetCashflow_HUF(i);
+        else
+            simplePayback_year(i) = inf;
+        end
     end
 
     % ---------------------------------------------------------------------
-    % 10) Result table
+    % Évesített mennyiségek
+    % ---------------------------------------------------------------------
+    annualPVEnergy_MWh = pvEnergyAvailable_kWh ./ simYears ./ 1000;
+    annualPvToLoad_MWh = pvToLoad_kWh ./ simYears ./ 1000;
+    annualPvToBess_MWh = pvToBess_kWh ./ simYears ./ 1000;
+    annualBessToLoad_MWh = bessToLoad_kWh ./ simYears ./ 1000;
+    annualCurtailment_MWh = curtailment_kWh ./ simYears ./ 1000;
+    annualUnusedPV_MWh = unusedPV_kWh ./ simYears ./ 1000;
+    annualGridImportReduction_MWh = gridImportReduction_kWh ./ simYears ./ 1000;
+    annualBessEquivalentCycles = bessEquivalentCycles ./ simYears;
+
+    % ---------------------------------------------------------------------
+    % Result table
     % ---------------------------------------------------------------------
     resultTable = table();
 
     resultTable.candidateIndex = candidateIndex;
+
     resultTable.P_inv_kW = P_inv_kW;
     resultTable.P_PV_kW = P_PV_kW;
     resultTable.E_BESS_kWh = E_BESS_kWh;
@@ -391,15 +646,29 @@ function evaluationResult = evaluation(cfg)
     resultTable.gridImport_kWh = gridImport_kWh;
     resultTable.gridExport_kWh = gridExport_kWh;
     resultTable.curtailment_kWh = curtailment_kWh;
+    resultTable.unusedPV_kWh = unusedPV_kWh;
+
+    resultTable.inverterLoss_kWh = inverterLoss_kWh;
+    resultTable.internalNetworkLoss_kWh = internalNetworkLoss_kWh;
+
+    resultTable.bessCellLoss_kWh = bessCellLoss_kWh;
+    resultTable.bessTotalInternalLoss_kWh = bessTotalInternalLoss_kWh;
+    resultTable.dcdcConversionLoss_kWh = dcdcConversionLoss_kWh;
+    resultTable.inverterConversionLoss_kWh = inverterConversionLoss_kWh;
+    resultTable.inverterPowerClipped_kWh = inverterPowerClipped_kWh;
+    resultTable.inverterPvClipped_kWh = inverterPvClipped_kWh;
+    resultTable.inverterBessClipped_kWh = inverterBessClipped_kWh;
 
     resultTable.gridImportReduction_kWh = gridImportReduction_kWh;
     resultTable.gridImportReduction_pct = gridImportReduction_pct;
+
     resultTable.directSelfConsumption_pct = directSelfConsumption_pct;
-    resultTable.selfConsumption_pct = selfConsumption_pct;
     resultTable.selfConsumptionGross_pct = selfConsumptionGross_pct;
+    resultTable.selfConsumption_pct = selfConsumption_pct;
     resultTable.selfSufficiency_pct = selfSufficiency_pct;
     resultTable.curtailment_pct = curtailment_pct;
     resultTable.gridExport_pct = gridExport_pct;
+    resultTable.unusedPV_pct = unusedPV_pct;
     resultTable.bessEquivalentCycles = bessEquivalentCycles;
     resultTable.finalSoH = finalSoH;
 
@@ -422,200 +691,95 @@ function evaluationResult = evaluation(cfg)
     resultTable.energyCostSavings_HUF = energyCostSavings_HUF;
     resultTable.periodNetValue_HUF = periodNetValue_HUF;
 
-    resultTable.LCSE_HUF_per_kWh_saved = LCOE_saved_HUF_per_kWh;
-    resultTable.LCOE_saved_HUF_per_kWh = LCOE_saved_HUF_per_kWh;
+    resultTable.annualEnergySavings_HUF = annualEnergySavings_HUF;
     resultTable.annualNetCashflow_HUF = annualNetCashflow_HUF;
+
+    resultTable.LCSE_HUF_per_kWh_saved = LCSE_HUF_per_kWh_saved;
+    resultTable.LCOE_usefulPV_HUF_per_kWh = LCOE_usefulPV_HUF_per_kWh;
+
     resultTable.NPV_HUF = NPV_HUF;
+    resultTable.NPV_millionHUF = NPV_HUF ./ 1e6;
+    resultTable.periodNetValue_millionHUF = periodNetValue_HUF ./ 1e6;
+
     resultTable.discountedPayback_year = discountedPayback_year;
+    resultTable.simplePayback_year = simplePayback_year;
 
-    % ---------------------------------------------------------------------
-    % 11) Legjobb candidate kivalasztasa
-    % ---------------------------------------------------------------------
-    selectionMode = lower(string(local_get_cfg_value( ...
-        cfg, {'evaluation', 'selectionMode'}, "minLCSE")));
-
-    minGridImportReduction_pct = local_get_cfg_value( ...
-        cfg, {'evaluation', 'minGridImportReduction_pct'}, 0);
-
-    requirePositiveNPV = logical(local_get_cfg_value( ...
-        cfg, {'evaluation', 'requirePositiveNPV'}, false));
-
-    requireBESS = logical(local_get_cfg_value( ...
-        cfg, {'evaluation', 'requireBESS'}, false));
-
-    feasibleMask = ...
-        isfinite(NPV_HUF) & ...
-        isfinite(LCOE_saved_HUF_per_kWh) & ...
-        gridImportReduction_kWh > 0 & ...
-        gridImportReduction_pct >= minGridImportReduction_pct;
-
-    if ismember('hasError', T.Properties.VariableNames)
-        feasibleMask = feasibleMask & ~T.hasError;
-    end
+    resultTable.annualPVEnergy_MWh = annualPVEnergy_MWh;
+    resultTable.annualPvToLoad_MWh = annualPvToLoad_MWh;
+    resultTable.annualPvToBess_MWh = annualPvToBess_MWh;
+    resultTable.annualBessToLoad_MWh = annualBessToLoad_MWh;
+    resultTable.annualCurtailment_MWh = annualCurtailment_MWh;
+    resultTable.annualUnusedPV_MWh = annualUnusedPV_MWh;
+    resultTable.annualGridImportReduction_MWh = annualGridImportReduction_MWh;
+    resultTable.annualBessEquivalentCycles = annualBessEquivalentCycles;
 
     if ismember('wasSimulated', T.Properties.VariableNames)
-        feasibleMask = feasibleMask & T.wasSimulated;
+        resultTable.wasSimulated = T.wasSimulated;
+    else
+        error('A candidateTable nem tartalmaz wasSimulated mezőt.');
     end
 
-    if requirePositiveNPV
-        feasibleMask = feasibleMask & NPV_HUF > 0;
+    if ismember('hasError', T.Properties.VariableNames)
+        resultTable.hasError = T.hasError;
+    else
+        error('A candidateTable nem tartalmaz hasError mezőt.');
     end
-
-    if requireBESS
-        feasibleMask = feasibleMask & E_BESS_kWh > 1e-9;
-    end
-
-    bestByNPVIndex = local_pick_best_index(NPV_HUF, feasibleMask, "max");
-    bestByLCSEIndex = local_pick_best_index(LCOE_saved_HUF_per_kWh, feasibleMask, "min");
-    bestByPaybackIndex = local_pick_best_index(discountedPayback_year, feasibleMask, "min");
-
-    switch selectionMode
-        case {"maxnpv", "npv"}
-            bestIdx = bestByNPVIndex;
-            selectedCriterionText = "maximum NPV";
-
-        case {"minlcse", "lcse", "minlcoe", "lcoe"}
-            bestIdx = bestByLCSEIndex;
-            selectedCriterionText = "minimum LCSE / LCOE_saved";
-
-        case {"minpayback", "payback", "discountedpayback"}
-            bestIdx = bestByPaybackIndex;
-            selectedCriterionText = "minimum discounted payback";
-
-        otherwise
-            error('Ismeretlen cfg.evaluation.selectionMode: %s', selectionMode);
-    end
-
-    bestCandidate = resultTable(bestIdx, :);
-
-    fprintf('\nLegjobb candidate gazdasagi szempontbol:\n');
-    fprintf('  Selection mode: %s\n', selectedCriterionText);
-    fprintf('  candidateIndex: %d\n', bestIdx);
-    fprintf('  P_inv       = %.2f kW\n', P_inv_kW(bestIdx));
-    fprintf('  P_PV        = %.2f kW\n', P_PV_kW(bestIdx));
-    fprintf('  E_BESS      = %.2f kWh\n', E_BESS_kWh(bestIdx));
-    fprintf('  P_BESS      = %.2f kW\n', P_BESS_kW(bestIdx));
-    fprintf('  DCAC ratio  = %.3f\n', DCAC_ratio(bestIdx));
-    fprintf('  BESS/PV     = %.3f kWh/kWp\n', BESS_PV_ratio(bestIdx));
-    fprintf('  Final SoH   = %.2f %%\n', finalSoH(bestIdx) * 100);
-    fprintf('  Grid import reduction = %.2f %%\n', gridImportReduction_pct(bestIdx));
-    fprintf('  Self-consumption      = %.2f %%\n', selfConsumption_pct(bestIdx));
-    fprintf('  Self-sufficiency      = %.2f %%\n', selfSufficiency_pct(bestIdx));
-    fprintf('  LCSE / LCOE_saved     = %.2f HUF/kWh\n', LCOE_saved_HUF_per_kWh(bestIdx));
-    fprintf('  Discounted payback    = %.2f year\n', discountedPayback_year(bestIdx));
-    fprintf('  NPV                   = %.2f million HUF\n', NPV_HUF(bestIdx) / 1e6);
-    fprintf('  Period net value      = %.2f million HUF\n\n', periodNetValue_HUF(bestIdx) / 1e6);
-
-    fprintf('Osszehasonlito optimumok:\n');
-    fprintf('  Best by NPV:     candidate %d, NPV = %.2f million HUF, LCSE = %.2f HUF/kWh\n', ...
-        bestByNPVIndex, NPV_HUF(bestByNPVIndex) / 1e6, LCOE_saved_HUF_per_kWh(bestByNPVIndex));
-
-    fprintf('  Best by LCSE:    candidate %d, NPV = %.2f million HUF, LCSE = %.2f HUF/kWh\n', ...
-        bestByLCSEIndex, NPV_HUF(bestByLCSEIndex) / 1e6, LCOE_saved_HUF_per_kWh(bestByLCSEIndex));
-
-    fprintf('  Best by payback: candidate %d, NPV = %.2f million HUF, payback = %.2f year\n\n', ...
-        bestByPaybackIndex, NPV_HUF(bestByPaybackIndex) / 1e6, discountedPayback_year(bestByPaybackIndex));
-
-    % ---------------------------------------------------------------------
-    % 12) Abrak
-    % ---------------------------------------------------------------------
-    local_plot_metric_set( ...
-        P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-        gridImportReduction_pct, ...
-        'Grid import reduction', '%', bestIdx, savePath, 'grid_import_reduction');
-
-    local_plot_metric_set( ...
-        P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-        selfConsumption_pct, ...
-        'Self-consumption', '%', bestIdx, savePath, 'self_consumption');
-
-    local_plot_metric_set( ...
-        P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-        selfSufficiency_pct, ...
-        'Self-sufficiency', '%', bestIdx, savePath, 'self_sufficiency');
-
-    local_plot_metric_set( ...
-        P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-        LCOE_saved_HUF_per_kWh, ...
-        'LCSE / LCOE saved', 'HUF/kWh', bestIdx, savePath, 'lcse');
-
-    local_plot_metric_set( ...
-        P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-        discountedPayback_year, ...
-        'Discounted payback', 'year', bestIdx, savePath, 'discounted_payback');
-
-    local_plot_metric_set( ...
-        P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-        periodNetValue_HUF / 1e6, ...
-        'Period net value', 'million HUF', bestIdx, savePath, 'period_net_value');
-
-    local_plot_best_candidate_summary(resultTable, bestIdx, savePath);
-
-    % ---------------------------------------------------------------------
-    % 13) Mentes
-    % ---------------------------------------------------------------------
-    evaluationResult = struct();
-
-    evaluationResult.config = cfg;
-    evaluationResult.sourceFile = resultFilePath;
-    evaluationResult.resultTable = resultTable;
-    evaluationResult.bestIdx = bestIdx;
-    evaluationResult.bestCandidate = bestCandidate;
-    evaluationResult.bestByNPVIndex = bestByNPVIndex;
-    evaluationResult.bestByLCSEIndex = bestByLCSEIndex;
-    evaluationResult.bestByPaybackIndex = bestByPaybackIndex;
-
-    evaluationResult.assumptions = struct();
-    evaluationResult.assumptions.simYears = simYears;
-    evaluationResult.assumptions.projectLifetime_years = projectLifetime_years;
-    evaluationResult.assumptions.pvLifetime_years = pvLifetime_years;
-    evaluationResult.assumptions.inverterLifetime_years = inverterLifetime_years;
-    evaluationResult.assumptions.discountRate = discountRate;
-
-    save(fullfile(savePath, 'evaluation_result.mat'), 'evaluationResult');
-    writetable(resultTable, fullfile(savePath, 'evaluation_result_table.csv'));
-
-    fprintf('Evaluation kesz.\n');
-    fprintf('Mentett MAT: %s\n', fullfile(savePath, 'evaluation_result.mat'));
-    fprintf('Mentett CSV: %s\n', fullfile(savePath, 'evaluation_result_table.csv'));
 end
 
 
 % =========================================================================
-% DB BETOLTES
+% OSZLOP KIOLVASÁS
 % =========================================================================
-function DB = local_find_db_struct(S)
-
-    if isfield(S, 'DB')
-        DB = S.DB;
-        return;
-    end
-
-    names = fieldnames(S);
-
-    for i = 1:numel(names)
-        candidate = S.(names{i});
-
-        if isstruct(candidate) && isfield(candidate, 'candidateTable')
-            DB = candidate;
-            return;
-        end
-    end
-
-    error('Nem talaltam DB strukturalis valtozot a MAT fajlban.');
-end
-
-
-% =========================================================================
-% OSZLOP KIOLVASAS
-% =========================================================================
-function values = local_get_numeric_column(T, possibleNames, defaultValue)
+function values = local_get_required_column(T, possibleNames)
 
     if ischar(possibleNames) || isstring(possibleNames)
         possibleNames = cellstr(possibleNames);
     end
 
-    n = height(T);
+    for k = 1:numel(possibleNames)
+
+        colName = possibleNames{k};
+
+        if ismember(colName, T.Properties.VariableNames)
+
+            raw = T.(colName);
+
+            if iscell(raw)
+                values = zeros(height(T), 1);
+                for i = 1:height(T)
+                    values(i) = double(raw{i});
+                end
+            elseif isstring(raw)
+                values = str2double(raw(:));
+            elseif islogical(raw)
+                values = double(raw(:));
+            else
+                values = double(raw(:));
+            end
+
+            if numel(values) ~= height(T)
+                error('A(z) %s oszlop mérete hibás.', colName);
+            end
+
+            return;
+        end
+    end
+
+    namesText = strjoin(possibleNames, ', ');
+    error('Hiányzó kötelező oszlop a candidateTable-ben. Elfogadott nevek: %s', namesText);
+end
+
+
+function finalSoH = local_get_required_final_soh(T, E_BESS_kWh)
+
+    possibleNames = { ...
+        'finalSoH', ...
+        'finalSOH', ...
+        'SOH_final', ...
+        'bessFinalSoH', ...
+        'BESS_finalSoH'};
+
+    hasBessCandidate = any(E_BESS_kWh > 1e-9);
 
     for k = 1:numel(possibleNames)
 
@@ -623,157 +787,645 @@ function values = local_get_numeric_column(T, possibleNames, defaultValue)
 
         if ismember(name, T.Properties.VariableNames)
 
-            raw = T.(name);
-
-            if iscell(raw)
-                raw = cellfun(@double, raw);
-            end
-
-            if isstring(raw)
-                raw = str2double(raw);
-            end
-
-            values = double(raw(:));
-            return;
-        end
-    end
-
-    if isscalar(defaultValue)
-        values = repmat(defaultValue, n, 1);
-    else
-        values = defaultValue(:);
-    end
-end
-
-
-% =========================================================================
-% FINAL SOH
-% =========================================================================
-function finalSoH = local_get_final_soh(T, DB, nCandidates)
-
-    possibleTableNames = { ...
-        'finalSoH', ...
-        'SOH_final', ...
-        'finalSOH', ...
-        'bessFinalSoH', ...
-        'BESS_finalSoH', ...
-        'eval_finalSoH'};
-
-    for k = 1:numel(possibleTableNames)
-
-        name = possibleTableNames{k};
-
-        if ismember(name, T.Properties.VariableNames)
-
             finalSoH = double(T.(name)(:));
 
-            finalSoH(finalSoH <= 0 | finalSoH > 1 | ~isfinite(finalSoH)) = NaN;
+            invalidMask = ...
+                ~isfinite(finalSoH) | ...
+                finalSoH <= 0 | ...
+                finalSoH > 1;
 
-            if ismember('E_BESS_kWh', T.Properties.VariableNames)
-                noBessMask = T.E_BESS_kWh <= 1e-9;
-                finalSoH(noBessMask) = 1;
+            noBessMask = E_BESS_kWh <= 1e-9;
+
+            if any(invalidMask & ~noBessMask)
+                error(['A finalSoH oszlop tartalmaz hibás értéket BESS-es candidate esetében. ', ...
+                       'Ellenőrizd a simulate_candidates_database végén a finalSoH mentését.']);
             end
 
-            missingMask = isnan(finalSoH);
-
-            if any(missingMask)
-                warning('%d candidate eseteben hianyzik a finalSoH. Ezeknel finalSoH = 1 lesz.', sum(missingMask));
-                finalSoH(missingMask) = 1;
-            end
+            finalSoH(noBessMask) = 1;
 
             return;
         end
     end
 
-    if isfield(DB, 'candidateProfiles')
-
-        P = DB.candidateProfiles;
-
-        possibleProfileNames = { ...
-            'meanSoH', ...
-            'minSoH', ...
-            'finalSoH'};
-
-        for k = 1:numel(possibleProfileNames)
-
-            name = possibleProfileNames{k};
-
-            if isfield(P, name)
-
-                M = P.(name);
-
-                if size(M, 1) == nCandidates
-                    finalSoH = double(M(:, end));
-                    finalSoH(finalSoH <= 0 | finalSoH > 1 | ~isfinite(finalSoH)) = 1;
-                    return;
-                end
-            end
-        end
+    if hasBessCandidate
+        error(['Hiányzik a finalSoH a candidateTable-ből, miközben vannak BESS-es candidate-ek. ', ...
+               'Futtasd újra a szimulációt olyan simulate_candidates_database verzióval, ', ...
+               'amely elmenti a finalSoH mezőt.']);
     end
 
-    warning(['Nem talaltam final SoH mezot a DB-ben. ', ...
-             'A BESS degradacios CAPEX koltseg pontatlan lesz, mert finalSoH = 1 ertekkel szamolok.']);
-
-    finalSoH = ones(nCandidates, 1);
+    finalSoH = ones(height(T), 1);
 end
 
 
 % =========================================================================
-% SAFE DIVIDE
+% BIZTONSÁGOS OSZTÁS
 % =========================================================================
-function y = local_safe_divide_vec(a, b)
+function y = local_divide_required(a, b, metricName)
+
+    a = double(a(:));
+    b = double(b(:));
+
+    if numel(a) ~= numel(b)
+        error('Méreteltérés az osztásnál: %s', metricName);
+    end
 
     y = NaN(size(a));
 
-    mask = isfinite(a) & isfinite(b) & abs(b) > 1e-12;
+    valid = isfinite(a) & isfinite(b) & abs(b) > 1e-12;
 
-    y(mask) = a(mask) ./ b(mask);
+    if any(~valid)
+        % BESS ciklusszámnál a no-BESS eseteket később külön kezeljük.
+        if ~strcmp(metricName, 'bessEquivalentCycles')
+            error('Érvénytelen osztás a(z) %s számításánál. Nulla vagy NaN nevező található.', metricName);
+        end
+    end
+
+    y(valid) = a(valid) ./ b(valid);
 end
 
 
 % =========================================================================
-% CFG HELPERS
+% LEGJOBB CANDIDATE KIVÁLASZTÁSA
 % =========================================================================
-function value = local_get_cfg_value(cfg, pathCells, defaultValue)
+function bestIdx = local_select_best_candidate(resultTable, evalCfg, extraMask)
 
-    value = defaultValue;
-
-    current = cfg;
-
-    for k = 1:numel(pathCells)
-
-        fieldName = pathCells{k};
-
-        if ~isstruct(current) || ~isfield(current, fieldName)
-            value = defaultValue;
-            return;
-        end
-
-        current = current.(fieldName);
+    if nargin < 3
+        error('local_select_best_candidate: extraMask kötelező.');
     end
 
-    if isempty(current)
-        value = defaultValue;
+    mode = lower(string(evalCfg.selection.mode));
+
+    feasibleMask = extraMask(:);
+
+    if numel(feasibleMask) ~= height(resultTable)
+        error('A feasibleMask mérete nem egyezik a resultTable magasságával.');
+    end
+
+    feasibleMask = feasibleMask & ...
+        resultTable.gridImportReduction_pct >= evalCfg.selection.minGridImportReduction_pct;
+
+    if evalCfg.selection.requirePositiveNPV
+        feasibleMask = feasibleMask & resultTable.NPV_HUF > 0;
+    end
+
+    if evalCfg.selection.requireBESS
+        feasibleMask = feasibleMask & resultTable.E_BESS_kWh > 1e-9;
+    end
+
+    feasibleMask = feasibleMask & resultTable.wasSimulated & ~resultTable.hasError;
+
+    switch mode
+
+        case {"minlcse", "lcse"}
+            values = resultTable.LCSE_HUF_per_kWh_saved;
+            bestIdx = local_pick_best_index(values, feasibleMask, "min");
+
+        case {"maxnpv", "npv"}
+            values = resultTable.NPV_HUF;
+            bestIdx = local_pick_best_index(values, feasibleMask, "max");
+
+        case {"mindiscountedpayback", "discountedpayback", "payback"}
+            values = resultTable.discountedPayback_year;
+            bestIdx = local_pick_best_index(values, feasibleMask, "min");
+
+        case {"maxperiodnetvalue", "periodnetvalue"}
+            values = resultTable.periodNetValue_HUF;
+            bestIdx = local_pick_best_index(values, feasibleMask, "max");
+
+        otherwise
+            error('Ismeretlen evalCfg.selection.mode: %s', mode);
+    end
+end
+
+
+function bestIdx = local_pick_best_index(values, feasibleMask, direction)
+
+    values = double(values(:));
+    feasibleMask = logical(feasibleMask(:));
+
+    valid = feasibleMask & isfinite(values);
+
+    if ~any(valid)
+        error('Nincs értékelhető candidate a megadott szűrőfeltételekkel.');
+    end
+
+    switch string(direction)
+
+        case "min"
+            tmp = values;
+            tmp(~valid) = inf;
+            [~, bestIdx] = min(tmp);
+
+        case "max"
+            tmp = values;
+            tmp(~valid) = -inf;
+            [~, bestIdx] = max(tmp);
+
+        otherwise
+            error('Ismeretlen direction: %s', string(direction));
+    end
+end
+
+
+% =========================================================================
+% RIPORTTÁBLÁZAT: 3 LEGJOBB JELÖLT
+% =========================================================================
+function optimalSystemTable = local_create_optimal_system_table(resultTable, indices, names)
+
+    if numel(indices) ~= 3
+        error('Az optimalSystemTable pontosan 3 jelöltet vár.');
+    end
+
+    labels = { ...
+        'Napelemes rendszer teljesítménye'; ...
+        'Inverter névleges teljesítménye'; ...
+        'Akkumulátor kapacitása'; ...
+        'Akkumulátor névleges teljesítménye'; ...
+        'Hálózati import csökkenése'; ...
+        'Éves villamosenergia-megtakarítás'; ...
+        'Éves töltési/kisütési ciklusszám'; ...
+        'Megtermelt PV energia'; ...
+        'PV által közvetlenül fedezett energia'; ...
+        'PV által akkumulátorba töltött energia'; ...
+        'Akkumulátor által szolgáltatott energia'; ...
+        'Nem hasznosított PV energia'; ...
+        'PV visszwattos/levágási veszteség'; ...
+        'Veszteségek összesen'; ...
+        'Nettó jelenérték'; ...
+        'Teljes beruházási költség'; ...
+        'Statikus megtérülési idő'; ...
+        'Diszkontált megtérülési idő'; ...
+        'LCSE - megtakarított energia fajlagos költsége'; ...
+        'LCOE - hasznosított PV energia fajlagos költsége'; ...
+        'candidateIndex'};
+
+    units = { ...
+        'kWp'; ...
+        'kW'; ...
+        'kWh'; ...
+        'kW'; ...
+        '%'; ...
+        'millió Ft/év'; ...
+        'db/év'; ...
+        'MWh/év'; ...
+        'MWh/év'; ...
+        'MWh/év'; ...
+        'MWh/év'; ...
+        'MWh/év'; ...
+        'MWh/év'; ...
+        'MWh/év'; ...
+        'millió Ft'; ...
+        'millió Ft'; ...
+        'év'; ...
+        'év'; ...
+        'Ft/kWh'; ...
+        'Ft/kWh'; ...
+        '-'};
+
+    values = strings(numel(labels), 3);
+
+    for c = 1:3
+
+        idx = indices(c);
+
+        totalLoss_MWh_per_year = ...
+            (resultTable.inverterLoss_kWh(idx) + ...
+             resultTable.internalNetworkLoss_kWh(idx) + ...
+             resultTable.bessTotalInternalLoss_kWh(idx) + ...
+             resultTable.dcdcConversionLoss_kWh(idx)) / ...
+             local_get_sim_years_from_annual_values(resultTable, idx);
+
+        rowValues = { ...
+            resultTable.P_PV_kW(idx); ...
+            resultTable.P_inv_kW(idx); ...
+            resultTable.E_BESS_kWh(idx); ...
+            resultTable.P_BESS_kW(idx); ...
+            resultTable.gridImportReduction_pct(idx); ...
+            resultTable.annualEnergySavings_HUF(idx) / 1e6; ...
+            resultTable.annualBessEquivalentCycles(idx); ...
+            resultTable.annualPVEnergy_MWh(idx); ...
+            resultTable.annualPvToLoad_MWh(idx); ...
+            resultTable.annualPvToBess_MWh(idx); ...
+            resultTable.annualBessToLoad_MWh(idx); ...
+            resultTable.annualUnusedPV_MWh(idx); ...
+            resultTable.annualCurtailment_MWh(idx); ...
+            totalLoss_MWh_per_year; ...
+            resultTable.NPV_millionHUF(idx); ...
+            resultTable.initialCapex_HUF(idx) / 1e6; ...
+            resultTable.simplePayback_year(idx); ...
+            resultTable.discountedPayback_year(idx); ...
+            resultTable.LCSE_HUF_per_kWh_saved(idx); ...
+            resultTable.LCOE_usefulPV_HUF_per_kWh(idx); ...
+            resultTable.candidateIndex(idx)};
+
+        for r = 1:numel(rowValues)
+
+            value = rowValues{r};
+
+            if r == 3 || r == 4 || r == 7 || r == 10 || r == 11
+                if abs(value) < 1e-9
+                    values(r, c) = "-";
+                else
+                    values(r, c) = local_format_number(value);
+                end
+            else
+                values(r, c) = local_format_number(value);
+            end
+        end
+    end
+
+    optimalSystemTable = table();
+
+    optimalSystemTable.Mennyiseg = string(labels);
+    optimalSystemTable.(matlab.lang.makeValidName(names(1))) = values(:, 1);
+    optimalSystemTable.(matlab.lang.makeValidName(names(2))) = values(:, 2);
+    optimalSystemTable.(matlab.lang.makeValidName(names(3))) = values(:, 3);
+    optimalSystemTable.Mertekegyseg = string(units);
+end
+
+
+function simYearsApprox = local_get_sim_years_from_annual_values(resultTable, idx)
+
+    if resultTable.annualPVEnergy_MWh(idx) > 0
+        simYearsApprox = resultTable.pvEnergyAvailable_kWh(idx) / ...
+            (resultTable.annualPVEnergy_MWh(idx) * 1000);
     else
-        value = current;
+        simYearsApprox = 1;
     end
 end
 
 
-function value = local_get_first_cfg_value(cfg, pathList, defaultValue)
+% =========================================================================
+% SZÍNEZETT MÁTRIX TÁBLÁZATOK
+% =========================================================================
+function [matrixTable, matrixData] = local_create_metric_matrix_table(resultTable, metricField, direction)
 
-    value = defaultValue;
+    if ~ismember(metricField, resultTable.Properties.VariableNames)
+        error('A resultTable nem tartalmazza ezt a metrikát: %s', metricField);
+    end
 
-    for i = 1:numel(pathList)
+    xVals = unique(resultTable.P_PV_kW(isfinite(resultTable.P_PV_kW)));
+    yVals = unique(resultTable.BESS_PV_ratio(isfinite(resultTable.BESS_PV_ratio)));
 
-        pathCells = pathList{i};
-        tmp = local_get_cfg_value(cfg, pathCells, []);
+    xVals = sort(xVals(:).');
+    yVals = sort(yVals(:));
 
-        if ~isempty(tmp)
-            value = tmp;
-            return;
+    Z = NaN(numel(yVals), numel(xVals));
+    candidateIdxMatrix = NaN(numel(yVals), numel(xVals));
+
+    metricValues = resultTable.(metricField);
+
+    for iy = 1:numel(yVals)
+        for ix = 1:numel(xVals)
+
+            mask = ...
+                abs(resultTable.P_PV_kW - xVals(ix)) < 1e-9 & ...
+                abs(resultTable.BESS_PV_ratio - yVals(iy)) < 1e-9 & ...
+                resultTable.wasSimulated & ...
+                ~resultTable.hasError & ...
+                isfinite(metricValues);
+
+            if any(mask)
+
+                candidateRows = find(mask);
+                candidateMetricValues = metricValues(candidateRows);
+
+                switch string(direction)
+                    case "min"
+                        [bestValue, localIdx] = min(candidateMetricValues);
+
+                    case "max"
+                        [bestValue, localIdx] = max(candidateMetricValues);
+
+                    otherwise
+                        error('Ismeretlen direction: %s', string(direction));
+                end
+
+                Z(iy, ix) = bestValue;
+                candidateIdxMatrix(iy, ix) = candidateRows(localIdx);
+            end
         end
     end
+
+    rowLabels = strings(numel(yVals), 1);
+
+    for iy = 1:numel(yVals)
+        if abs(yVals(iy)) < 1e-12
+            rowLabels(iy) = "Akkumulátor nélkül";
+        else
+            rowLabels(iy) = sprintf('BESS/PV = %.2f kWh/kWp', yVals(iy));
+        end
+    end
+
+    colLabels = strings(1, numel(xVals));
+
+    for ix = 1:numel(xVals)
+        colLabels(ix) = sprintf('%.0f kWp', xVals(ix));
+    end
+
+    matrixTable = table();
+    matrixTable.BESS_PV_arany = rowLabels;
+
+    for ix = 1:numel(xVals)
+        colName = matlab.lang.makeValidName(sprintf('PV_%.0f_kWp', xVals(ix)));
+        matrixTable.(colName) = Z(:, ix);
+    end
+
+    matrixData = struct();
+    matrixData.xVals = xVals;
+    matrixData.yVals = yVals;
+    matrixData.rowLabels = rowLabels;
+    matrixData.colLabels = colLabels;
+    matrixData.Z = Z;
+    matrixData.candidateIdxMatrix = candidateIdxMatrix;
+    matrixData.metricField = metricField;
+    matrixData.direction = direction;
+end
+
+
+function local_plot_colored_matrix_table(matrixData, metricLabel, metricUnit, direction, savePath, fileTag)
+
+    Z = matrixData.Z;
+    rowLabels = matrixData.rowLabels;
+    colLabels = matrixData.colLabels;
+
+    nRows = size(Z, 1);
+    nCols = size(Z, 2);
+
+    finiteVals = Z(isfinite(Z));
+
+    if isempty(finiteVals)
+        error('Nincs véges érték a színezett táblázathoz: %s', metricLabel);
+    end
+
+    vMin = min(finiteVals);
+    vMax = max(finiteVals);
+
+    figW = max(1000, 120 + 90 * nCols);
+    figH = max(550, 120 + 36 * nRows);
+
+    fig = figure('Name', metricLabel, ...
+        'Position', [100, 100, figW, figH]);
+
+    ax = axes(fig);
+    hold(ax, 'on');
+    axis(ax, 'equal');
+    axis(ax, 'off');
+
+    cellW = 1.0;
+    cellH = 0.45;
+    rowLabelW = 3.0;
+
+    totalW = rowLabelW + nCols * cellW;
+    totalH = (nRows + 1) * cellH;
+
+    xlim(ax, [0, totalW]);
+    ylim(ax, [0, totalH]);
+
+    % ---------------------------------------------------------------------
+    % Fejléc
+    % ---------------------------------------------------------------------
+    rectangle(ax, ...
+        'Position', [0, totalH - cellH, rowLabelW, cellH], ...
+        'FaceColor', [0.92, 0.92, 0.92], ...
+        'EdgeColor', 'k');
+
+    text(ax, rowLabelW / 2, totalH - cellH / 2, ...
+        'BESS/PV arány', ...
+        'HorizontalAlignment', 'center', ...
+        'VerticalAlignment', 'middle', ...
+        'FontWeight', 'bold', ...
+        'Interpreter', 'none');
+
+    for ix = 1:nCols
+        x0 = rowLabelW + (ix - 1) * cellW;
+
+        rectangle(ax, ...
+            'Position', [x0, totalH - cellH, cellW, cellH], ...
+            'FaceColor', [0.92, 0.92, 0.92], ...
+            'EdgeColor', 'k');
+
+        text(ax, x0 + cellW / 2, totalH - cellH / 2, ...
+            char(colLabels(ix)), ...
+            'HorizontalAlignment', 'center', ...
+            'VerticalAlignment', 'middle', ...
+            'FontWeight', 'bold', ...
+            'FontSize', 8, ...
+            'Interpreter', 'none');
+    end
+
+    % ---------------------------------------------------------------------
+    % Cellák
+    % ---------------------------------------------------------------------
+    for iy = 1:nRows
+
+        y0 = totalH - (iy + 1) * cellH;
+
+        rectangle(ax, ...
+            'Position', [0, y0, rowLabelW, cellH], ...
+            'FaceColor', [0.96, 0.96, 0.96], ...
+            'EdgeColor', 'k');
+
+        text(ax, 0.05, y0 + cellH / 2, ...
+            char(rowLabels(iy)), ...
+            'HorizontalAlignment', 'left', ...
+            'VerticalAlignment', 'middle', ...
+            'FontSize', 8, ...
+            'Interpreter', 'none');
+
+        for ix = 1:nCols
+
+            x0 = rowLabelW + (ix - 1) * cellW;
+            value = Z(iy, ix);
+
+            if isfinite(value)
+                color = local_value_to_green_yellow_red(value, vMin, vMax, direction);
+                textValue = local_format_number(value);
+            else
+                color = [1, 1, 1];
+                textValue = "-";
+            end
+
+            rectangle(ax, ...
+                'Position', [x0, y0, cellW, cellH], ...
+                'FaceColor', color, ...
+                'EdgeColor', 'k');
+
+            text(ax, x0 + cellW / 2, y0 + cellH / 2, ...
+                textValue, ...
+                'HorizontalAlignment', 'center', ...
+                'VerticalAlignment', 'middle', ...
+                'FontSize', 8, ...
+                'Interpreter', 'none');
+        end
+    end
+
+    title(ax, sprintf('%s [%s]', metricLabel, metricUnit), ...
+        'Interpreter', 'none', ...
+        'FontWeight', 'bold');
+
+    saveas(fig, fullfile(savePath, [fileTag, '.png']));
+    savefig(fig, fullfile(savePath, [fileTag, '.fig']));
+end
+
+
+function color = local_value_to_green_yellow_red(value, vMin, vMax, direction)
+
+    if abs(vMax - vMin) < 1e-12
+        score = 0.5;
+    else
+        rawScore = (value - vMin) / (vMax - vMin);
+
+        switch string(direction)
+            case "max"
+                score = rawScore;
+            case "min"
+                score = 1 - rawScore;
+            otherwise
+                error('Ismeretlen direction: %s', string(direction));
+        end
+    end
+
+    score = max(0, min(1, score));
+
+    red = [0.85, 0.15, 0.15];
+    yellow = [1.00, 0.90, 0.15];
+    green = [0.15, 0.70, 0.25];
+
+    if score <= 0.5
+        t = score / 0.5;
+        color = (1 - t) * red + t * yellow;
+    else
+        t = (score - 0.5) / 0.5;
+        color = (1 - t) * yellow + t * green;
+    end
+end
+
+
+% =========================================================================
+% OPCIONÁLIS 3D SCATTER ÁBRÁK
+% =========================================================================
+function local_plot_selected_3d_scatters(resultTable, evalCfg, bestIdx, savePath)
+
+    for m = 1:numel(evalCfg.metrics)
+
+        metricField = char(evalCfg.metrics(m).field);
+        metricLabel = char(evalCfg.metrics(m).label);
+        metricUnit = char(evalCfg.metrics(m).unit);
+        direction = string(evalCfg.metrics(m).direction);
+
+        if ~evalCfg.plots.showAllMetrics && ~evalCfg.metrics(m).plotWhenCompact
+            continue;
+        end
+
+        if ~ismember(metricField, resultTable.Properties.VariableNames)
+            error('A resultTable nem tartalmazza a 3D scatterhez kért metrikát: %s', metricField);
+        end
+
+        metricValues = resultTable.(metricField);
+
+        local_plot_3d_scatter( ...
+            resultTable.P_inv_kW, ...
+            resultTable.P_PV_kW, ...
+            resultTable.E_BESS_kWh, ...
+            metricValues, ...
+            metricLabel, ...
+            metricUnit, ...
+            direction, ...
+            bestIdx, ...
+            savePath, ...
+            metricField);
+    end
+end
+
+
+function local_plot_3d_scatter(P_inv_kW, P_PV_kW, E_BESS_kWh, metricValues, ...
+    metricLabel, metricUnit, direction, bestIdx, savePath, fileTag)
+
+    fig = figure('Name', ['3D scatter - ', metricLabel], ...
+        'Position', [100, 100, 1100, 800]);
+
+    hold on;
+    grid on;
+    box on;
+
+    finiteMask = ...
+        isfinite(P_inv_kW) & ...
+        isfinite(P_PV_kW) & ...
+        isfinite(E_BESS_kWh) & ...
+        isfinite(metricValues);
+
+    scatter3( ...
+        P_inv_kW(finiteMask), ...
+        P_PV_kW(finiteMask), ...
+        E_BESS_kWh(finiteMask), ...
+        45, ...
+        metricValues(finiteMask), ...
+        'filled');
+
+    plot3( ...
+        P_inv_kW(bestIdx), ...
+        P_PV_kW(bestIdx), ...
+        E_BESS_kWh(bestIdx), ...
+        'kp', ...
+        'MarkerSize', 16, ...
+        'MarkerFaceColor', 'w', ...
+        'LineWidth', 1.8);
+
+    xlabel('Inverter névleges teljesítménye [kW]');
+    ylabel('Napelemes rendszer teljesítménye [kWp]');
+    zlabel('Akkumulátor kapacitása [kWh]');
+
+    title(sprintf('%s a candidate térben', metricLabel), ...
+        'Interpreter', 'none');
+
+    cb = colorbar;
+    cb.Label.String = sprintf('%s [%s]', metricLabel, metricUnit);
+
+    colormap(gca, local_green_yellow_red_colormap(direction, 256));
+
+    view(45, 25);
+
+    saveas(fig, fullfile(savePath, ['scatter3_', char(fileTag), '.png']));
+    savefig(fig, fullfile(savePath, ['scatter3_', char(fileTag), '.fig']));
+end
+
+
+function cmap = local_green_yellow_red_colormap(direction, n)
+
+    if nargin < 2
+        n = 256;
+    end
+
+    red = [0.85, 0.15, 0.15];
+    yellow = [1.00, 0.90, 0.15];
+    green = [0.15, 0.70, 0.25];
+
+    n1 = floor(n / 2);
+    n2 = n - n1;
+
+    switch string(direction)
+
+        case "max"
+            c1 = local_interp_color(red, yellow, n1);
+            c2 = local_interp_color(yellow, green, n2);
+
+        case "min"
+            c1 = local_interp_color(green, yellow, n1);
+            c2 = local_interp_color(yellow, red, n2);
+
+        otherwise
+            error('Ismeretlen direction: %s', string(direction));
+    end
+
+    cmap = [c1; c2];
+end
+
+
+function C = local_interp_color(cStart, cEnd, n)
+
+    t = linspace(0, 1, n).';
+    C = (1 - t) .* cStart + t .* cEnd;
 end
 
 
@@ -806,17 +1458,19 @@ function paybackYear = local_discounted_payback(initialCapex, annualNetCashflow,
 
     for y = 1:lifetimeYears
 
-        prevCumulative = cumulative;
-        cumulative = cumulative + annualNetCashflow / ((1 + discountRate) ^ y);
+        previousCumulative = cumulative;
+
+        cumulative = cumulative + ...
+            annualNetCashflow / ((1 + discountRate) ^ y);
 
         if cumulative >= 0
 
-            yearlyDiscountedCashflow = cumulative - prevCumulative;
+            yearlyDiscountedCashflow = cumulative - previousCumulative;
 
             if yearlyDiscountedCashflow <= 0
                 paybackYear = y;
             else
-                fraction = abs(prevCumulative) / yearlyDiscountedCashflow;
+                fraction = abs(previousCumulative) / yearlyDiscountedCashflow;
                 paybackYear = (y - 1) + fraction;
             end
 
@@ -829,281 +1483,51 @@ end
 
 
 % =========================================================================
-% BEST PICKER
+% FORMÁZÁS ÉS MENTÉS
 % =========================================================================
-function bestIdx = local_pick_best_index(metricValues, feasibleMask, direction)
+function s = local_format_number(x)
 
-    metricValues = metricValues(:);
-    feasibleMask = feasibleMask(:);
-
-    if ~any(feasibleMask)
-        warning('Nincs feasible candidate a megadott szurokkel. A teljes halmazon valasztok.');
-        feasibleMask = isfinite(metricValues);
-    end
-
-    if ~any(feasibleMask)
-        error('Nincs egyetlen ertekelheto candidate sem.');
-    end
-
-    switch lower(string(direction))
-
-        case "max"
-            tmp = metricValues;
-            tmp(~feasibleMask) = -inf;
-            [~, bestIdx] = max(tmp);
-
-        case "min"
-            tmp = metricValues;
-            tmp(~feasibleMask) = inf;
-            [~, bestIdx] = min(tmp);
-
-        otherwise
-            error('Ismeretlen direction: %s', direction);
-    end
-end
-
-
-% =========================================================================
-% PLOT WRAPPER
-% =========================================================================
-function local_plot_metric_set(P_inv_kW, P_PV_kW, E_BESS_kWh, DCAC_ratio, BESS_PV_ratio, ...
-    metricValues, metricName, metricUnit, bestIdx, savePath, fileTag)
-
-    local_plot_3d_scatter( ...
-        P_inv_kW, ...
-        P_PV_kW, ...
-        E_BESS_kWh, ...
-        metricValues, ...
-        metricName, ...
-        metricUnit, ...
-        bestIdx, ...
-        savePath, ...
-        fileTag);
-
-    local_plot_inverter_heatmaps( ...
-        P_inv_kW, ...
-        DCAC_ratio, ...
-        BESS_PV_ratio, ...
-        metricValues, ...
-        metricName, ...
-        metricUnit, ...
-        bestIdx, ...
-        savePath, ...
-        fileTag);
-end
-
-
-% =========================================================================
-% 3D SCATTER
-% =========================================================================
-function local_plot_3d_scatter(P_inv_kW, P_PV_kW, E_BESS_kWh, metricValues, ...
-    metricName, metricUnit, bestIdx, savePath, fileTag)
-
-    fig = figure('Name', ['3D scatter - ', metricName], ...
-        'Position', [100, 100, 1100, 800]);
-
-    hold on;
-    grid on;
-    box on;
-
-    finiteMask = isfinite(metricValues) & ...
-                 isfinite(P_inv_kW) & ...
-                 isfinite(P_PV_kW) & ...
-                 isfinite(E_BESS_kWh);
-
-    scatter3( ...
-        P_inv_kW(finiteMask), ...
-        P_PV_kW(finiteMask), ...
-        E_BESS_kWh(finiteMask), ...
-        45, ...
-        metricValues(finiteMask), ...
-        'filled');
-
-    plot3( ...
-        P_inv_kW(bestIdx), ...
-        P_PV_kW(bestIdx), ...
-        E_BESS_kWh(bestIdx), ...
-        'kp', ...
-        'MarkerSize', 16, ...
-        'MarkerFaceColor', 'w', ...
-        'LineWidth', 1.8);
-
-    xlabel('P_{inv} [kW]');
-    ylabel('P_{PV} [kW]');
-    zlabel('E_{BESS} [kWh]');
-
-    title(sprintf('%s in candidate space', metricName), ...
-        'Interpreter', 'none');
-
-    cb = colorbar;
-    cb.Label.String = sprintf('%s [%s]', metricName, metricUnit);
-
-    view(45, 25);
-
-    saveas(fig, fullfile(savePath, ['scatter3_', fileTag, '.png']));
-    savefig(fig, fullfile(savePath, ['scatter3_', fileTag, '.fig']));
-end
-
-
-% =========================================================================
-% INVERTERENKENTI HEATMAP
-% =========================================================================
-function local_plot_inverter_heatmaps(P_inv_kW, DCAC_ratio, BESS_PV_ratio, metricValues, ...
-    metricName, metricUnit, bestIdx, savePath, fileTag)
-% LOCAL_PLOT_INVERTER_HEATMAPS
-%
-% Egy metrikahoz inverterenkenti heatmapeket rajzol.
-% Az osszes subplot ugyanazt a color range-et hasznalja.
-
-    uniqueInv = unique(P_inv_kW(isfinite(P_inv_kW)));
-    uniqueInv = sort(uniqueInv(:));
-
-    if isempty(uniqueInv)
-        warning('Nincs ervenyes invertermeret a heatmaphez: %s', metricName);
+    if ~isfinite(x)
+        if isinf(x)
+            s = "NaN";
+        else
+            s = "NaN";
+        end
         return;
     end
 
-    if numel(uniqueInv) > 4
-        uniqueInv = uniqueInv(1:4);
-    end
+    ax = abs(x);
 
-    xVals = unique(DCAC_ratio(isfinite(DCAC_ratio)));
-    yVals = unique(BESS_PV_ratio(isfinite(BESS_PV_ratio)));
-
-    xVals = sort(xVals(:));
-    yVals = sort(yVals(:));
-
-    finiteVals = metricValues(isfinite(metricValues));
-
-    if isempty(finiteVals)
-        commonCLim = [0, 1];
+    if ax >= 1000
+        s = string(sprintf('%.0f', x));
+    elseif ax >= 100
+        s = string(sprintf('%.1f', x));
+    elseif ax >= 10
+        s = string(sprintf('%.1f', x));
+    elseif ax >= 1
+        s = string(sprintf('%.2f', x));
     else
-        vMin = min(finiteVals);
-        vMax = max(finiteVals);
-
-        if abs(vMax - vMin) < 1e-12
-            pad = max(abs(vMin) * 0.01, 1e-6);
-            commonCLim = [vMin - pad, vMax + pad];
-        else
-            commonCLim = [vMin, vMax];
-        end
+        s = string(sprintf('%.3f', x));
     end
-
-    fig = figure('Name', ['Heatmaps by inverter - ', metricName], ...
-        'Position', [120, 120, 1300, 850]);
-
-    tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
-
-    for iInv = 1:4
-
-        nexttile;
-        hold on;
-        grid on;
-
-        if iInv > numel(uniqueInv)
-            axis off;
-            continue;
-        end
-
-        invValue = uniqueInv(iInv);
-
-        Z = NaN(numel(yVals), numel(xVals));
-
-        for ix = 1:numel(xVals)
-            for iy = 1:numel(yVals)
-
-                mask = abs(P_inv_kW - invValue) < 1e-9 & ...
-                       abs(DCAC_ratio - xVals(ix)) < 1e-9 & ...
-                       abs(BESS_PV_ratio - yVals(iy)) < 1e-9;
-
-                if any(mask)
-                    Z(iy, ix) = mean(metricValues(mask), 'omitnan');
-                end
-            end
-        end
-
-        imagesc(xVals, yVals, Z);
-        set(gca, 'YDir', 'normal');
-
-        caxis(commonCLim);
-
-        xlabel('DC/AC ratio [-]');
-        ylabel('BESS/PV ratio [kWh/kWp]');
-        title(sprintf('P_{inv} = %.0f kW', invValue));
-
-        cb = colorbar;
-        cb.Label.String = sprintf('%s [%s]', metricName, metricUnit);
-
-        if abs(P_inv_kW(bestIdx) - invValue) < 1e-9
-            plot(DCAC_ratio(bestIdx), BESS_PV_ratio(bestIdx), ...
-                'kp', ...
-                'MarkerSize', 14, ...
-                'MarkerFaceColor', 'w', ...
-                'LineWidth', 1.5);
-        end
-    end
-
-    sgtitle(sprintf('%s by inverter size, common color range', metricName), ...
-        'Interpreter', 'none');
-
-    saveas(fig, fullfile(savePath, ['heatmap_by_inverter_', fileTag, '.png']));
-    savefig(fig, fullfile(savePath, ['heatmap_by_inverter_', fileTag, '.fig']));
 end
 
 
-% =========================================================================
-% BEST CANDIDATE SUMMARY PLOT
-% =========================================================================
-function local_plot_best_candidate_summary(resultTable, bestIdx, savePath)
+function local_safe_writetable(T, filePath)
 
-    labels = categorical({ ...
-        'Grid import reduction', ...
-        'Self-consumption', ...
-        'Self-sufficiency', ...
-        'Curtailment', ...
-        'Final SoH'});
+    if exist(filePath, 'file')
+        try
+            delete(filePath);
+        catch
+            error(['Nem tudom felülírni a fájlt, mert valószínűleg meg van nyitva ', ...
+                   'Excelben vagy más programban:\n%s\n\nZárd be a fájlt, majd futtasd újra.'], ...
+                   filePath);
+        end
+    end
 
-    values = [ ...
-        resultTable.gridImportReduction_pct(bestIdx), ...
-        resultTable.selfConsumption_pct(bestIdx), ...
-        resultTable.selfSufficiency_pct(bestIdx), ...
-        resultTable.curtailment_pct(bestIdx), ...
-        resultTable.finalSoH(bestIdx) * 100];
-
-    fig = figure('Name', 'Best candidate technical metrics', ...
-        'Position', [200, 200, 1000, 650]);
-
-    bar(labels, values);
-    grid on;
-    ylabel('[%]');
-    title('Best candidate technical indicators');
-    ylim([0, max(100, max(values) * 1.15)]);
-
-    saveas(fig, fullfile(savePath, 'best_candidate_technical_summary.png'));
-    savefig(fig, fullfile(savePath, 'best_candidate_technical_summary.fig'));
-
-    costLabels = categorical({ ...
-        'Initial CAPEX', ...
-        'Allocated total cost', ...
-        'Energy savings', ...
-        'Period net value', ...
-        'NPV'});
-
-    costValues = [ ...
-        resultTable.initialCapex_HUF(bestIdx), ...
-        resultTable.allocatedTotalCost_HUF(bestIdx), ...
-        resultTable.energyCostSavings_HUF(bestIdx), ...
-        resultTable.periodNetValue_HUF(bestIdx), ...
-        resultTable.NPV_HUF(bestIdx)] / 1e6;
-
-    fig2 = figure('Name', 'Best candidate economic metrics', ...
-        'Position', [250, 250, 1000, 650]);
-
-    bar(costLabels, costValues);
-    grid on;
-    ylabel('[million HUF]');
-    title('Best candidate economic indicators');
-
-    saveas(fig2, fullfile(savePath, 'best_candidate_economic_summary.png'));
-    savefig(fig2, fullfile(savePath, 'best_candidate_economic_summary.fig'));
+    try
+        writetable(T, filePath);
+    catch ME
+        error('Nem sikerült kiírni a táblázatot:\n%s\n\nEredeti hiba:\n%s', ...
+            filePath, ME.message);
+    end
 end
