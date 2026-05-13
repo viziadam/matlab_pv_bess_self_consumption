@@ -1,10 +1,24 @@
-function process_production_to_structured_data(P_stc, inputFolderPath, outputFolderPath, targetStepMin, consumptionFolderPath)
+function process_production_to_structured_data(P_stc, targetStepMin)
 % PROCESS_PRODUCTION_TO_STRUCTURED_DATA
 %
-% Feldolgozza a havi BSRN .tab fajlokat, es napi bontasban legeneralja
+% Feldolgozza a BUD BSRN .tab fajlokat, es napi bontasban legeneralja
 % a resultBuffer strukturakat megadott perces felbontasban.
 %
-% Ha consumptionFolderPath meg van adva:
+% Bemenetek:
+%   P_stc         : PV modul nevleges teljesitmenye [W]
+%   targetStepMin : kimeneti idofelbontas [perc], pl. 5, 10, 15, 30, 60
+%
+% Hasznalat:
+%   process_production_to_structured_data(500, 15)
+%
+% Automatikus mappaszerkezet:
+%
+%   process_production_to_structured_data.m mappaja/
+%       production_csv/   -> bemeneti BUD .tab fajlok
+%       consumption/      -> fogyasztasi consumption_ORIG_*.mat fajlok
+%       production/       -> kimeneti resultBuffer_ORIG_*.mat fajlok
+%
+% Ha a consumption mappa tartalmaz consumption_ORIG_*.mat fajlokat:
 %   - a fogyasztasi napok datumait olvassa ki
 %   - a BSRN napokat honap-nap szerint illeszti a fogyasztasi napokhoz
 %   - pelda:
@@ -17,11 +31,23 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
 %   Igy a fogyasztasi idosor eve es a meteorologiai idosor eve lehet kulonbozo,
 %   de a szezonalis egyezes megmarad.
 
-    if nargin < 4 || isempty(targetStepMin)
-        targetStepMin = 5;
+    % ---------------------------------------------------------------------
+    % 0) Automatikus mappautvonalak
+    % ---------------------------------------------------------------------
+    functionFullPath = mfilename('fullpath');
+    functionFolderPath = fileparts(functionFullPath);
+
+    inputFolderPath = fullfile(functionFolderPath, 'production_csv');
+    consumptionFolderPath = fullfile(functionFolderPath, 'consumption');
+    outputFolderPath = fullfile(functionFolderPath, 'production');
+
+    if nargin < 1 || isempty(P_stc)
+        error('P_stc megadasa kotelezo. Pelda: process_production_to_structured_data(500, 15)');
     end
 
-    matchToConsumption = nargin >= 5 && ~isempty(consumptionFolderPath);
+    if nargin < 2 || isempty(targetStepMin)
+        targetStepMin = 5;
+    end
 
     if targetStepMin <= 0 || abs(targetStepMin - round(targetStepMin)) > 1e-9
         error('targetStepMin pozitiv egesz perc kell legyen.');
@@ -31,15 +57,40 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
         error('targetStepMin olyan ertek kell legyen, amely osztja az 1440 percet. Pelda: 5, 10, 15, 30, 60.');
     end
 
+    if ~exist(inputFolderPath, 'dir')
+        error('Nem talalhato production_csv mappa: %s', inputFolderPath);
+    end
+
     if ~exist(outputFolderPath, 'dir')
         mkdir(outputFolderPath);
     end
 
-    filePattern = fullfile(inputFolderPath, '*.tab');
-    bsrnFiles = dir(filePattern);
+    matchToConsumption = false;
+
+    if exist(consumptionFolderPath, 'dir')
+        consumptionFiles = dir(fullfile(consumptionFolderPath, 'consumption_ORIG_*.mat'));
+
+        if ~isempty(consumptionFiles)
+            matchToConsumption = true;
+        end
+    end
+
+    % ---------------------------------------------------------------------
+    % BUD .tab fajlok keresese a production_csv mappaban
+    % ---------------------------------------------------------------------
+    allTabFiles = dir(fullfile(inputFolderPath, '*.tab'));
+
+    if isempty(allTabFiles)
+        error('Nem talalhato .tab fajl a megadott mappaban: %s', inputFolderPath);
+    end
+
+    tabFileNames = string({allTabFiles.name});
+    budMask = contains(upper(tabFileNames), "BUD");
+
+    bsrnFiles = allTabFiles(budMask);
 
     if isempty(bsrnFiles)
-        error('Nem talalhato .tab fajl a megadott mappaban: %s', inputFolderPath);
+        error('Nem talalhato BUD .tab fajl a megadott mappaban: %s', inputFolderPath);
     end
 
     [~, idxSort] = sort({bsrnFiles.name});
@@ -50,7 +101,7 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
         nTargetDays = numel(targetDates);
 
         fprintf('Fogyasztasi napok szama: %d\n', nTargetDays);
-        fprintf('BSRN havi fajlok szama: %d\n', numel(bsrnFiles));
+        fprintf('BSRN BUD havi fajlok szama: %d\n', numel(bsrnFiles));
         fprintf('Kimeneti idofelbontas: %d perc\n', targetStepMin);
         fprintf('Szinkronizalt mentes fogyasztasi datumokra.\n');
         fprintf('Illesztes modja: BSRN honap-nap == consumption honap-nap.\n\n');
@@ -58,7 +109,7 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
         targetDates = NaT(0,1);
         nTargetDays = inf;
 
-        fprintf('Osszesen %d db havi fajl feldolgozasa indul...\n', length(bsrnFiles));
+        fprintf('Osszesen %d db BUD havi fajl feldolgozasa indul...\n', length(bsrnFiles));
         fprintf('Kimeneti idofelbontas: %d perc\n\n', targetStepMin);
     end
 
@@ -150,21 +201,6 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
             % -------------------------------------------------------------
             % C/1) Fogyasztasi napokhoz valo szinkronizalas
             % -------------------------------------------------------------
-            % Itt tortenik a lenyegi modositas:
-            %
-            % Ha consumptionFolderPath meg van adva, akkor nem sorrendben
-            % parositjuk az elso BSRN napot az elso fogyasztasi nappal.
-            %
-            % Ehelyett mindig a kovetkezo fogyasztasi naphoz tartozo
-            % honap-nap parost keressuk a BSRN adatokban.
-            %
-            % Pelda:
-            %   nextTargetDate = 2011-01-01
-            %   currentDay     = 2023-07-01 -> nem jo, kihagyas
-            %   currentDay     = 2023-07-02 -> nem jo, kihagyas
-            %   ...
-            %   currentDay     = 2024-01-01 -> jo, mentes 2011-01-01 neven
-            % -------------------------------------------------------------
             if matchToConsumption
 
                 nextTargetDate = targetDates(savedDayCounter + 1);
@@ -199,12 +235,15 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
             if iscell(rawGHI) || isstring(rawGHI)
                 rawGHI = str2double(string(rawGHI));
             end
+
             if iscell(rawDIF) || isstring(rawDIF)
                 rawDIF = str2double(string(rawDIF));
             end
+
             if iscell(rawSWU) || isstring(rawSWU)
                 rawSWU = str2double(string(rawSWU));
             end
+
             if iscell(rawTamb) || isstring(rawTamb)
                 rawTamb = str2double(string(rawTamb));
             end
@@ -312,8 +351,7 @@ function process_production_to_structured_data(P_stc, inputFolderPath, outputFol
             end
 
             % -----------------------------------------------------------------
-            % H) Ugyanaz a resultBuffer generalas, csak a mentett datum
-            %    fogyasztasi datum lehet.
+            % H) ResultBuffer generalas
             % -----------------------------------------------------------------
             create_daily_production_buffer(P_stc, saveYear, saveMonth, saveDay, tminVec, ...
                 GHI_out, DIF_out, SWU_out, Tamb_out, ...
@@ -493,9 +531,12 @@ function create_daily_production_buffer(P_stc, year, month, day, tminVec, GHI_ve
         'azimuth', sunAzim_vec);
 
     resultBuffer.irradiationData = struct( ...
-        'GHI', GHI_vec, ...
-        'DIF', DIF_vec, ...
-        'ALBEDO', SWU_vec);
+        'GHI', ...
+        GHI_vec, ...
+        'DIF', ...
+        DIF_vec, ...
+        'ALBEDO', ...
+        SWU_vec);
 
     resultBuffer.temperatureData = struct( ...
         'Tamb', Tamb_vec);
@@ -511,7 +552,7 @@ function create_daily_production_buffer(P_stc, year, month, day, tminVec, GHI_ve
 
     save(fullFilePath, 'resultBuffer');
 
-    fprintf('Sikeres mentes: %s\n', fullFilePath);
+    % fprintf('Sikeres mentes: %s\n', fullFilePath);
 end
 
 

@@ -273,7 +273,7 @@ function Deg = deg_model_init(E_cap_nom, cap_floor_frac)
     % Kalibracios szorzok
     % ---------------------------------------------------------------------
     Deg.cycle_stress_scale = 0.83;
-    Deg.calendar_stress_scale = 2.65;
+    Deg.calendar_stress_scale = 1.0;
 
     % ---------------------------------------------------------------------
     % Xu-fele ciklikus stressz faktorok

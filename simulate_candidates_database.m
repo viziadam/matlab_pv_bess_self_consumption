@@ -188,6 +188,32 @@ function DB = simulate_candidates_database(data, DB, cfg)
 
     nCandidates = DB.nCandidates;
     nDays = DB.nDays;
+    
+    %If diagnostic mode
+    diagnosticMode = isfield(cfg, 'diagnostics') && ...
+                 isfield(cfg.diagnostics, 'testMode') && ...
+                 cfg.diagnostics.testMode;
+
+    if diagnosticMode
+
+        if ~isfield(cfg.diagnostics, 'candidateIndex') || isempty(cfg.diagnostics.candidateIndex)
+            error('cfg.diagnostics.testMode = true, de cfg.diagnostics.candidateIndex nincs megadva.');
+        end
+
+        candidateList = cfg.diagnostics.candidateIndex(:).';
+
+        if any(candidateList < 1) || any(candidateList > nCandidates)
+            error('Ervenytelen diagnostics candidateIndex.');
+        end
+
+        fprintf('\nDIAGNOSTIC TEST MODE ACTIVE\n');
+        fprintf('Only selected candidate(s) will be simulated.\n');
+        disp(candidateList);
+
+    else
+        candidateList = 1:nCandidates;
+    end
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% - Diagnostic mode end
 
     % ---------------------------------------------------------------------
     % Biztositjuk a finalSoH / finalSoC oszlopokat
@@ -198,8 +224,8 @@ function DB = simulate_candidates_database(data, DB, cfg)
     DB.candidateTable = local_ensure_numeric_column( ...
         DB.candidateTable, 'finalSoC', nCandidates);
 
-    for c = 1:nCandidates
-
+    for cLoop = 1:numel(candidateList)
+        c = candidateList(cLoop);
         candidateID = DB.candidateTable.candidateID(c);
 
         fprintf('\nRunning candidate %d / %d: %s\n', ...
@@ -212,7 +238,21 @@ function DB = simulate_candidates_database(data, DB, cfg)
             % Candidate design
             % -------------------------------------------------------------
             design = table_row_to_design(DB.candidateTable(c, :));
-
+            
+            % -----------------------------------------------------
+            %Diagnostic mode
+            %---------------------------------------------------------------
+            if diagnosticMode
+                diag = bess_runtime_diagnostics( ...
+                    'init', ...
+                    data, ...
+                    DB, ...
+                    c, ...
+                    design, ...
+                    cfg);
+            else
+                diag = [];
+            end
             % -------------------------------------------------------------
             % Initial BESS state
             % -------------------------------------------------------------
@@ -230,12 +270,29 @@ function DB = simulate_candidates_database(data, DB, cfg)
             for d = 1:nDays
 
                 dayInput = local_get_day_input(data, d);
+                
+                stateBefore = state;
+                
 
                 dayResult = simulate_day_vectorized( ...
                     dayInput, ...
                     state, ...
                     design, ...
                     cfg);
+                
+                state = dayResult.stateEnd;
+                
+                if diagnosticMode
+                    diag = bess_runtime_diagnostics( ...
+                        'update', ...
+                        diag, ...
+                        dayInput, ...
+                        dayResult, ...
+                        stateBefore, ...
+                        state, ...
+                        d, ...
+                        cfg);
+                end
 
                 running = update_metrics( ...
                     running, ...
@@ -262,6 +319,17 @@ function DB = simulate_candidates_database(data, DB, cfg)
             % Vegso BESS allapot mentese
             % -------------------------------------------------------------
             DB = local_store_final_bess_state(DB, c, state, design);
+
+            if diagnosticMode
+                diag = bess_runtime_diagnostics('finalize', diag, cfg);
+
+                if ~isfield(DB, 'diagnostics') || isempty(DB.diagnostics)
+                    DB.diagnostics = struct();
+                end
+
+                fieldName = sprintf('candidate_%d', c);
+                DB.diagnostics.(fieldName) = diag;
+            end
 
         catch ME
 

@@ -13,20 +13,24 @@ function [analysisResult, cfg] = analyze_load_profiles(cfg)
 %   1) Beolvassa a napi consumption es production .mat fajlokat.
 %   2) Datum szerint parositja oket.
 %   3) Kiszamolja a fogyasztasi/PV illeszkedesi mutatokat.
-%   4) Elkesziti a 3 fo abrazolast:
+%   4) Elkesziti a 4 fo abrazolast:
 %       - havi atlagos napon beluli fogyasztasi gorbek
 %       - havi energiafelhasznalas vs. PV termeles
 %       - het napjai szerinti fogyasztasi gorbek
-%   5) Osszegyujti a FOGYASZTASI teljesitmenyertekeket.
-%   6) Hisztogramot keszit a fogyasztasi teljesitmenyeloszlasbol.
-%   7) Percentilisek alapjan meghatarozza a javasolt invertermereteket.
+%       - napi fogyasztasi csucsteljesitmeny hisztogram
+%   5) Osszegyujti a fogyasztasi es PV teljesitmenymintakat.
+%   6) Kiszamolja a napi fogyasztasi csucsteljesitmenyeket.
+%   7) A NAPI FOGYASZTASI CSUCSOK percentilisei alapjan meghatarozza
+%      a javasolt invertermereteket.
 %   8) A javasolt invertermereteket visszairja:
 %       cfg.candidates.P_inv_kW_vec
 %       cfg.inverter.P_inv_kW
 %
 % Fontos:
-%   Az invertermeretezes NEM PV-teljesitmenybol tortenik,
-%   hanem a fogyasztasi teljesitmenyeloszlasbol.
+%   Az invertermeretezes NEM az osszes idolepes teljesitmenymintajabol,
+%   hanem a napi fogyasztasi csucsteljesitmenyekbol tortenik:
+%
+%       dailyLoadPeak_kW(d) = max(loadMatrix_kW(d, :))
 
     if nargin < 1
         error('A teljes szimulacios cfg bemenet szukseges.');
@@ -73,7 +77,7 @@ function [analysisResult, cfg] = analyze_load_profiles(cfg)
 
     fprintf('Valasztott PV orientacio: tiltX = %.1f deg, tiltZ = %.1f deg\n', tiltX, tiltZ);
     fprintf('Elemzesi PV teljesitmeny: %.1f kWp\n', pvForAnalysis_kW);
-    fprintf('Invertermeretezes alapja: fogyasztasi teljesitmenyeloszlas\n\n');
+    fprintf('Invertermeretezes alapja: napi fogyasztasi csucsteljesitmenyek percentilisei\n\n');
 
     % ---------------------------------------------------------------------
     % 2) Fajlok beolvasasa es datum szerinti parositas
@@ -203,7 +207,7 @@ function [analysisResult, cfg] = analyze_load_profiles(cfg)
     % ---------------------------------------------------------------------
     % 7) Datumcsoportositas
     % ---------------------------------------------------------------------
-    weekdayNum = weekday(commonDates);       % 1 = vasarnap, 7 = szombat
+    weekdayNum = weekday(commonDates);
     isWeekend = weekdayNum == 1 | weekdayNum == 7;
 
     monthNum = month(commonDates);
@@ -385,25 +389,29 @@ function [analysisResult, cfg] = analyze_load_profiles(cfg)
     end
 
     % ---------------------------------------------------------------------
-    % 13) FOGYASZTASI teljesitmenymintak es invertermeretezes
+    % 13) Teljesitmenymintak es invertermeretezes napi csucsokbol
     % ---------------------------------------------------------------------
     powerSamples = struct();
 
+    % Teljes idosoros mintak megmaradnak elemzeshez/debughoz.
     powerSamples.load_kW = loadMatrix_kW(:);
     powerSamples.pv_kW = pvMatrix_kW(:);
     powerSamples.directPV_kW = directPV_kW(:);
     powerSamples.pvSurplus_kW = pvSurplus_kW(:);
     powerSamples.loadDeficit_kW = loadDeficit_kW(:);
 
-    inverterSizing = local_estimate_inverter_sizes_from_load_histogram( ...
-        powerSamples.load_kW, ...
+    % Invertermerezes alapja: napi csucsteljesitmeny.
+    powerSamples.dailyLoadPeak_kW = dailyLoadPeak_kW(:);
+
+    inverterSizing = local_estimate_inverter_sizes_from_daily_peaks( ...
+        dailyLoadPeak_kW, ...
         cfg.analysis.inverterSizing);
 
     % Frissitett inverter meretek visszairasa a teljes szimulacios cfg-be.
     cfg.candidates.P_inv_kW_vec = inverterSizing.suggestedInverterSizes_kW(:).';
     cfg.inverter.P_inv_kW = cfg.candidates.P_inv_kW_vec(1);
 
-    fprintf('\nJavasolt inverter meretek FOGYASZTASI percentilisek alapjan:\n');
+    fprintf('\nJavasolt inverter meretek NAPI FOGYASZTASI CSUCS percentilisek alapjan:\n');
     disp(inverterSizing.candidateTable);
 
     fprintf('cfg.candidates.P_inv_kW_vec frissitve:\n');
@@ -446,13 +454,13 @@ function [analysisResult, cfg] = analyze_load_profiles(cfg)
         fullfile(savePath, 'self_consumption_monthly_analysis_table.csv'));
 
     writetable(inverterSizing.percentileTable, ...
-        fullfile(savePath, 'load_power_percentile_table.csv'));
+        fullfile(savePath, 'daily_load_peak_percentile_table.csv'));
 
     writetable(inverterSizing.histogramTable, ...
-        fullfile(savePath, 'load_power_histogram_table.csv'));
+        fullfile(savePath, 'daily_load_peak_histogram_table.csv'));
 
     writetable(inverterSizing.candidateTable, ...
-        fullfile(savePath, 'suggested_inverter_sizes_from_load.csv'));
+        fullfile(savePath, 'suggested_inverter_sizes_from_daily_peaks.csv'));
 
     if makePlots
         local_plot_results(analysisResult, cfg, figurePath);
@@ -564,9 +572,7 @@ function cfg = local_apply_analysis_defaults(cfg)
         cfg.analysis.inverterSizing = struct();
     end
 
-    % Fontos:
-    % Nincs source parameter.
-    % Az invertermeretezes mindig fogyasztasi teljesitmenybol tortenik.
+    % Az invertermeretezes napi fogyasztasi csucsokbol tortenik.
     if ~isfield(cfg.analysis.inverterSizing, 'percentiles')
         cfg.analysis.inverterSizing.percentiles = [90 95 98 99];
     end
@@ -645,29 +651,32 @@ end
 
 
 % =========================================================================
-% INVERTER MERETEZES FOGYASZTASI HISZTOGRAM ES PERCENTILISEK ALAPJAN
+% INVERTER MERETEZES NAPI FOGYASZTASI CSUCSOK ALAPJAN
 % =========================================================================
-function inverterSizing = local_estimate_inverter_sizes_from_load_histogram(loadPower_kW, sizingCfg)
-% LOCAL_ESTIMATE_INVERTER_SIZES_FROM_LOAD_HISTOGRAM
+function inverterSizing = local_estimate_inverter_sizes_from_daily_peaks(dailyLoadPeak_kW, sizingCfg)
+% LOCAL_ESTIMATE_INVERTER_SIZES_FROM_DAILY_PEAKS
 %
-% Invertermeretek meghatarozasa fogyasztasi teljesitmenyeloszlasbol.
+% Invertermeretek meghatarozasa a napi fogyasztasi csucsteljesitmenyekbol.
 %
-% Ez szandekosan NEM opcionalis source-val dolgozik.
-% A bemenet mindig a fogyasztasi teljesitmeny idosor osszes mintaja.
+% Fontos:
+%   Nem az osszes napon beluli teljesitmenymintabol dolgozik,
+%   hanem naponta egyetlen ertekbol:
+%
+%       dailyLoadPeak_kW(d) = max(loadMatrix_kW(d, :))
 %
 % A modszer:
-%   1) osszegyujti az osszes pozitiv fogyasztasi teljesitmenymintat,
-%   2) hisztogramot keszit,
+%   1) osszegyujti a pozitiv napi csucsokat,
+%   2) hisztogramot keszit a napi csucsokbol,
 %   3) kiszamolja a megadott percentiliseket,
 %   4) felkerekiti oket a megadott teljesitmenylepcsore,
-%   5) legfeljebb 4 kulonbozo invertermeretet ad vissza.
+%   5) legfeljebb maxCandidateCount darab invertermeretet ad vissza.
 
-    x = loadPower_kW(:);
+    x = dailyLoadPeak_kW(:);
     x = x(~isnan(x));
     xPositive = x(x > 1e-9);
 
     if isempty(xPositive)
-        error('Nincs pozitiv fogyasztasi teljesitmeny minta az inverter meretezeshez.');
+        error('Nincs pozitiv napi fogyasztasi csucsteljesitmeny az inverter meretezeshez.');
     end
 
     reportP = sizingCfg.reportPercentiles(:);
@@ -677,15 +686,15 @@ function inverterSizing = local_estimate_inverter_sizes_from_load_histogram(load
     histBinWidth_kW = sizingCfg.histBinWidth_kW;
 
     % ---------------------------------------------------------------------
-    % Percentilis tabla
+    % Percentilis tabla - napi csucsokbol
     % ---------------------------------------------------------------------
     percentileTable = table();
 
     percentileTable.Percentile = reportP;
-    percentileTable.LoadPower_kW = local_percentile_vector(xPositive, reportP);
+    percentileTable.DailyLoadPeak_kW = local_percentile_vector(xPositive, reportP);
 
     % ---------------------------------------------------------------------
-    % Hisztogram
+    % Hisztogram - napi csucsokbol
     % ---------------------------------------------------------------------
     maxPower = max(xPositive);
 
@@ -713,7 +722,7 @@ function inverterSizing = local_estimate_inverter_sizes_from_load_histogram(load
     histogramTable.CumulativeFrequency = cumsum(counts(:)) / sum(counts);
 
     % ---------------------------------------------------------------------
-    % Javasolt invertermeretek
+    % Javasolt invertermeretek - napi csucs percentilisekbol
     % ---------------------------------------------------------------------
     rawSizes_kW = local_percentile_vector(xPositive, sizingP);
 
@@ -748,15 +757,15 @@ function inverterSizing = local_estimate_inverter_sizes_from_load_histogram(load
 
     candidateTable = table();
 
-    candidateTable.Basis = repmat("Fogyasztasi teljesitmeny", numel(roundedUnique), 1);
+    candidateTable.Basis = repmat("Napi fogyasztasi csucsteljesitmeny", numel(roundedUnique), 1);
     candidateTable.BasisPercentile = pUnique(:);
-    candidateTable.RawLoadPower_kW = rawUnique(:);
+    candidateTable.RawDailyLoadPeak_kW = rawUnique(:);
     candidateTable.SuggestedInverter_kW = roundedUnique(:);
 
     inverterSizing = struct();
 
-    inverterSizing.basis = "load";
-    inverterSizing.basisLabel = "Fogyasztasi teljesitmeny";
+    inverterSizing.basis = "daily_load_peak";
+    inverterSizing.basisLabel = "Napi fogyasztasi csucsteljesitmeny";
     inverterSizing.roundStep_kW = roundStep_kW;
     inverterSizing.histBinWidth_kW = histBinWidth_kW;
 
@@ -769,7 +778,7 @@ function inverterSizing = local_estimate_inverter_sizes_from_load_histogram(load
 
     inverterSizing.suggestedInverterSizes_kW = roundedUnique(:).';
 
-    inverterSizing.loadPowerVector_kW = xPositive;
+    inverterSizing.dailyLoadPeakVector_kW = xPositive;
 end
 
 
@@ -854,8 +863,8 @@ function local_plot_results(analysisResult, cfg, figurePath)
     end
 
     xlabel('Idő');
-    ylabel('kW');
-    title('Átlag fogyasztás');
+    ylabel('Teljesítmény [kW]');
+    title('Havi átlagos napon belüli fogyasztási görbék');
     xlim([0 24]);
     xticks(xTicks);
     xticklabels(xTickLabels);
@@ -881,7 +890,7 @@ function local_plot_results(analysisResult, cfg, figurePath)
 
     area(monthIdx, M.DirectPVUse_kWh, ...
         'FaceAlpha', 0.45, ...
-        'DisplayName', 'Felhasznált energia');
+        'DisplayName', 'Közvetlenül felhasznált PV energia');
 
     bar(monthIdx, M.LoadEnergy_kWh, ...
         0.55, ...
@@ -889,8 +898,8 @@ function local_plot_results(analysisResult, cfg, figurePath)
         'DisplayName', 'Fogyasztás');
 
     xlabel('Hónap');
-    ylabel('kWh');
-    title(sprintf('%.0f kWp-es rendszer által termelt energia integrálhatósága a fogyasztásba havi szinten', ...
+    ylabel('Energia [kWh]');
+    title(sprintf('%.0f kWp-es rendszer termelésének közvetlen illeszkedése a fogyasztáshoz', ...
         cfg.analysis.PV_kW_forAnalysis));
 
     xticks(monthIdx);
@@ -920,8 +929,8 @@ function local_plot_results(analysisResult, cfg, figurePath)
     end
 
     xlabel('Idő');
-    ylabel('kW');
-    title('Átlag fogyasztás');
+    ylabel('Teljesítmény [kW]');
+    title('Heti napok szerinti átlagos fogyasztási görbék');
     xlim([0 24]);
     xticks(xTicks);
     xticklabels(xTickLabels);
@@ -930,9 +939,9 @@ function local_plot_results(analysisResult, cfg, figurePath)
     saveas(fig3, fullfile(figurePath, '03_heti_napok_atlagos_fogyasztasi_gorbei.png'));
 
     % ---------------------------------------------------------------------
-    % 4) FOGYASZTASI teljesitmeny hisztogram inverter meretezeshez
+    % 4) Napi fogyasztasi csucsteljesitmeny hisztogram inverter meretezeshez
     % ---------------------------------------------------------------------
-    fig4 = figure('Name', 'Fogyasztasi teljesitmeny hisztogram inverter meretezeshez', ...
+    fig4 = figure('Name', 'Napi fogyasztasi csucs hisztogram inverter meretezeshez', ...
         'Color', 'w', ...
         'Position', [160, 160, 1050, 560]);
 
@@ -944,7 +953,7 @@ function local_plot_results(analysisResult, cfg, figurePath)
 
     bar(H.BinCenter_kW, H.Count, 1.0, ...
         'FaceAlpha', 0.70, ...
-        'DisplayName', 'Fogyasztási teljesítmény');
+        'DisplayName', 'Napi fogyasztási csúcsteljesítmény');
 
     for i = 1:height(C)
 
@@ -955,10 +964,10 @@ function local_plot_results(analysisResult, cfg, figurePath)
             'HandleVisibility', 'off');
     end
 
-    xlabel('Fogyasztási teljesítmény [kW]');
-    ylabel('Előfordulások száma');
-    title('Fogyasztási teljesítményeloszlás és percentilis alapú inverter méretezés');
+    xlabel('Napi fogyasztási csúcsteljesítmény [kW]');
+    ylabel('Napok száma');
+    title('Napi fogyasztási csúcsteljesítmények és percentilis alapú inverterméretezés');
     legend('Location', 'best');
 
-    saveas(fig4, fullfile(figurePath, '04_fogyasztasi_teljesitmeny_hisztogram_inverter_meretezeshez.png'));
+    saveas(fig4, fullfile(figurePath, '04_napi_fogyasztasi_csucs_hisztogram_inverter_meretezeshez.png'));
 end

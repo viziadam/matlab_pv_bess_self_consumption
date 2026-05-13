@@ -31,6 +31,21 @@ function data = build_data(cfg)
         end
     end
 
+    % ---------------------------------------------------------------------
+    % Optional load scaling for testing
+    % ---------------------------------------------------------------------
+    loadScale = 1.0;
+
+    if isfield(cfg, 'loadScale')
+        loadScale = cfg.loadScale;
+    end
+
+    if ~isnumeric(loadScale) || ~isscalar(loadScale) || ~isfinite(loadScale) || loadScale <= 0
+        error('cfg.loadScale must be a positive finite scalar.');
+    end
+
+    fprintf('Load scale factor: %.4f\n', loadScale);
+
     Load = build_load_cache();
 
     PV = build_pv_cache( ...
@@ -71,7 +86,8 @@ function data = build_data(cfg)
         L = Load(idxLoad(d));
         P = PV(idxPV(d));
 
-        P_load_kW = L.P_load_kW(:).';
+        P_load_kW_raw = L.P_load_kW(:).';
+        P_load_kW = loadScale .* P_load_kW_raw;
         dt_load_h = L.dt_h;
 
         P_pv_base_kW = P.Ppv(:).';
@@ -105,6 +121,9 @@ function data = build_data(cfg)
     data.info.nDays = nDays;
     data.info.dt_h = data.days(1).dt_h;
     data.info.nT = numel(data.days(1).P_load_kW);
+
+    data.info.loadScale = loadScale;
+    data.info.noteLoadScale = "Load time series was scaled by cfg.loadScale during build_data.";
 
     data.info.firstDate = commonDates(1);
     data.info.lastDate = commonDates(end);

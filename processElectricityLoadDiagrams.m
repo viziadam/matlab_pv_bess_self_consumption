@@ -1,23 +1,36 @@
-
-function result = processElectricityLoadDiagrams(txtFilePath)
+function result = processElectricityLoadDiagrams(txtFileName)
 % PROCESSELECTRICITYLOADDIAGRAMS
-%processElectricityLoadDiagrams('C:\Users\Vizi\Downloads\electricityloaddiagrams20112014')
-% Feldolgozza az ElectricityLoadDiagrams20112014 fogyasztasi adatfajlt.
+%
+% Hasznalat:
+%   result = processElectricityLoadDiagrams('LD2011_2014.txt');
+%
+% A fuggveny az ElectricityLoadDiagrams20112014 fogyasztasi adatfajlt
+% dolgozza fel.
 %
 % Bemenet:
-%   txtFilePath - a txt fajl teljes eleresi utvonala
+%   txtFileName - csak a txt fajl neve, nem teljes eleresi utvonal
+%
+% Automatikus eleresi ut:
+%   aktualis_fuggveny_mappaja/consumption_csv/txtFileName
 %
 % Kimenet:
 %   result - struktura a feldolgozott adatokkal es jellemzokkel
 %
-% A fajl vart formatuma:
-%   - pontosvesszovel tagolt fajl
-%   - elso oszlop: idobelyeg
-%   - tovabbi oszlopok: MT_001 ... MT_370 fogyasztok
-%   - decimalis jel: vesszo
-%   - idofelbontas: 15 perc
+% Kivalasztasi logika:
+%   1) Meghatarozza a residential / commercial / industry jellegu
+%      fogyasztokat heurisztikusan.
 %
-% Megjegyzes:
+%   2) Kiszamolja minden fogyasztora a PV-termelesi idoszak
+%      atlagteljesitmenyet.
+%
+%   3) Kirajzolja azokat az ipari fogyasztokat, ahol:
+%
+%          PV-idoszaki atlagteljesitmeny <= 0.5 * csucsteljesitmeny
+%
+%   4) Ha nincs ilyen ipari fogyaszto, akkor kirajzolja az osszes
+%      ervenyes fogyasztasi profilt.
+%
+% Fontos:
 %   A dataset nem tartalmaz hivatalos residential / commercial / industry
 %   cimkeket. A besorolas heurisztikus, fogyasztasi mintazat alapjan tortenik.
 
@@ -25,19 +38,49 @@ function result = processElectricityLoadDiagrams(txtFilePath)
 
     maxProfilesPerFigure = 50;
 
+    % PV-termelesi idoszak, ahol azt vizsgaljuk, hogy a fogyasztas
+    % atlagosan legfeljebb a sajat csucsteljesitmeny fele-e.
+    pvProductionStartHour = 10;
+    pvProductionEndHour   = 14;
+
+    pvMeanToPeakLimit = 0.50;
+
+    if nargin < 1 || strlength(string(txtFileName)) == 0
+        error('Meg kell adni a bemeneti txt fajl nevet. Pelda: processElectricityLoadDiagrams(''LD2011_2014.txt'')');
+    end
+
+    txtFileName = char(txtFileName);
+
+    if contains(txtFileName, filesep) || contains(txtFileName, '/')
+        error('Csak a fajlnevet add meg, ne teljes eleresi utvonalat. Pelda: LD2011_2014.txt');
+    end
+
+    functionFullPath = mfilename('fullpath');
+    functionFolderPath = fileparts(functionFullPath);
+
+    inputFolderPath = fullfile(functionFolderPath, 'consumption_csv');
+    txtFilePath = fullfile(inputFolderPath, txtFileName);
+
+    if ~isfolder(inputFolderPath)
+        error('A consumption_csv mappa nem talalhato: %s', inputFolderPath);
+    end
+
     if ~isfile(txtFilePath)
         error('A megadott fajl nem talalhato: %s', txtFilePath);
     end
 
     fprintf('Fajl feldolgozasa indul...\n');
+    fprintf('Fuggveny mappa: %s\n', functionFolderPath);
     fprintf('Bemeneti fajl: %s\n', txtFilePath);
+    fprintf('PV-termelesi idoszak: %.1f - %.1f h\n', ...
+        pvProductionStartHour, pvProductionEndHour);
+    fprintf('Kivalasztasi feltetel: PV-idoszaki atlag <= %.2f * peak\n\n', ...
+        pvMeanToPeakLimit);
 
     %% 1. Decimalis vesszo kezelese ideiglenes fajllal
 
-    % A fajlban a decimalis jel vesszo, pl. 71,7703.
-    % A MATLAB biztosabb numerikus beolvasasa miatt ideiglenesen pontta alakitjuk.
     tempFilePath = createDecimalDotCopy(txtFilePath);
-    cleanupObj = onCleanup(@() deleteTempFile(tempFilePath));
+    cleanupObj = onCleanup(@() deleteTempFile(tempFilePath)); %#ok<NASGU>
 
     %% 2. Adatok beolvasasa table formaban
 
@@ -71,6 +114,7 @@ function result = processElectricityLoadDiagrams(txtFilePath)
     customerNames = erase(customerNames, '"');
 
     P = table2array(T(:, 2:end));
+    P(P < 0) = NaN;
 
     nSamples = size(P, 1);
     nCustomers = size(P, 2);
@@ -80,7 +124,8 @@ function result = processElectricityLoadDiagrams(txtFilePath)
 
     %% 4. Mintaveteli ido meghatarozasa
 
-    dt_h = hours(median(diff(time), 'omitnan'));
+    timeDiff_h = hours(diff(time));
+    dt_h = median(timeDiff_h, 'omitnan');
 
     fprintf('Becsult mintaveteli ido: %.4f ora\n', dt_h);
 
@@ -154,10 +199,11 @@ function result = processElectricityLoadDiagrams(txtFilePath)
         end
 
         hourOfDay = hour(timeWin) + minute(timeWin) / 60;
-        dayOfWeek = weekday(timeWin); % 1 = vasarnap, 7 = szombat
+        dayOfWeek = weekday(timeWin);
 
         isNight = hourOfDay < 6 | hourOfDay >= 22;
         isDaytime = hourOfDay >= 8 & hourOfDay < 18;
+
         isWeekend = dayOfWeek == 1 | dayOfWeek == 7;
         isWeekday = ~isWeekend;
 
@@ -170,14 +216,15 @@ function result = processElectricityLoadDiagrams(txtFilePath)
         end
 
         if any(isWeekend) && any(isWeekday)
+
             weekendEnergy = sum(pcWin(isWeekend), 'omitnan') * dt_h;
             weekdayEnergy = sum(pcWin(isWeekday), 'omitnan') * dt_h;
 
             weekendHours = sum(isWeekend) * dt_h;
             weekdayHours = sum(isWeekday) * dt_h;
 
-            avgWeekendPower = weekendEnergy / weekendHours;
-            avgWeekdayPower = weekdayEnergy / weekdayHours;
+            avgWeekendPower = weekendEnergy / max(weekendHours, eps);
+            avgWeekdayPower = weekdayEnergy / max(weekdayHours, eps);
 
             if avgWeekdayPower > 0
                 weekendToWeekdayRatio(c) = avgWeekendPower / avgWeekdayPower;
@@ -185,7 +232,6 @@ function result = processElectricityLoadDiagrams(txtFilePath)
         end
 
         dailyProfiles(:, c) = calculateAverageDailyProfile(timeWin, pcWin, samplesPerDay);
-
     end
 
     %% 6. Ervenyes fogyasztok megtartasa
@@ -208,13 +254,17 @@ function result = processElectricityLoadDiagrams(txtFilePath)
 
     fprintf('Ervenyes fogyasztok szama: %d\n', nValidCustomers);
 
+    if nValidCustomers == 0
+        error('Nincs egyetlen ervenyes fogyaszto sem.');
+    end
+
     %% 7. Heurisztikus kategorizalas
 
     category = strings(1, nValidCustomers);
 
-    qLowEnergy = quantile(avgDailyEnergy_kWh, 0.33);
-    qHighEnergy = quantile(avgDailyEnergy_kWh, 0.75);
-    qHighPeak = quantile(peakPower_kW, 0.75);
+    qLowEnergy = localPercentile(avgDailyEnergy_kWh, 33);
+    qHighEnergy = localPercentile(avgDailyEnergy_kWh, 75);
+    qHighPeak = localPercentile(peakPower_kW, 75);
 
     for c = 1:nValidCustomers
 
@@ -255,7 +305,36 @@ function result = processElectricityLoadDiagrams(txtFilePath)
         end
     end
 
-    %% 8. Osszefoglalo tabla
+    %% 8. PV-termelesi idoszaki metrikak
+
+    timeOfDay = duration(0, 0, 0) + minutes((0:samplesPerDay-1) * dt_h * 60);
+    hourAxis = hours(timeOfDay);
+
+    pvWindowMask = ...
+        hourAxis >= pvProductionStartHour & ...
+        hourAxis < pvProductionEndHour;
+
+    if ~any(pvWindowMask)
+        error('A PV-termelesi idoszakhoz nem tartozik egyetlen idopont sem.');
+    end
+
+    pvWindowMeanPower_kW = nan(1, nValidCustomers);
+    pvWindowPeakPower_kW = nan(1, nValidCustomers);
+    pvWindowMeanToPeakRatio = nan(1, nValidCustomers);
+
+    for c = 1:nValidCustomers
+
+        prof = dailyProfiles(:, c);
+
+        pvWindowMeanPower_kW(c) = mean(prof(pvWindowMask), 'omitnan');
+        pvWindowPeakPower_kW(c) = max(prof(pvWindowMask), [], 'omitnan');
+
+        if peakPower_kW(c) > 0
+            pvWindowMeanToPeakRatio(c) = pvWindowMeanPower_kW(c) / peakPower_kW(c);
+        end
+    end
+
+    %% 9. Osszefoglalo tabla
 
     summaryTable = table( ...
         customerNames(:), ...
@@ -269,6 +348,9 @@ function result = processElectricityLoadDiagrams(txtFilePath)
         nightRatio(:), ...
         daytimeRatio(:), ...
         weekendToWeekdayRatio(:), ...
+        pvWindowMeanPower_kW(:), ...
+        pvWindowPeakPower_kW(:), ...
+        pvWindowMeanToPeakRatio(:), ...
         'VariableNames', { ...
             'Customer', ...
             'Category', ...
@@ -280,44 +362,122 @@ function result = processElectricityLoadDiagrams(txtFilePath)
             'LoadFactor', ...
             'NightEnergyRatio', ...
             'DaytimeEnergyRatio', ...
-            'WeekendToWeekdayRatio'});
+            'WeekendToWeekdayRatio', ...
+            'PvWindowMeanPower_kW', ...
+            'PvWindowPeakPower_kW', ...
+            'PvWindowMeanToPeakRatio'});
 
     fprintf('\nKategoriak osszesitese:\n');
     disp(groupsummary(summaryTable, 'Category'));
 
-    %% 9. Plottolas kategoriankent, maximum 50 profil / abra
+    %% 10. Kivalasztas: industry + PV-idoszaki atlag <= peak fele
 
-    timeOfDay = duration(0, 0, 0) + minutes((0:samplesPerDay-1) * dt_h * 60);
+    selectedMask = ...
+        category(:) == "industry" & ...
+        pvWindowMeanToPeakRatio(:) <= pvMeanToPeakLimit;
 
-    plotDailyProfilesByCategory( ...
+    selectedIdx = find(selectedMask);
+
+    fallbackUsed = false;
+
+    fprintf('\nIpari fogyasztok, ahol PV-idoszaki atlag <= %.0f %% * peak: %d db\n', ...
+        pvMeanToPeakLimit * 100, numel(selectedIdx));
+
+    if isempty(selectedIdx)
+
+        warning(['Nincs olyan ipari fogyaszto, ahol a PV-termelesi idoszakban ', ...
+                 'az atlagos teljesitmeny legfeljebb a csucsteljesitmeny fele. ', ...
+                 'Ezert az osszes ervenyes fogyasztasi profilt rajzolom ki.']);
+
+        selectedIdx = 1:nValidCustomers;
+        fallbackUsed = true;
+    end
+
+    selectedTable = summaryTable(selectedIdx, :);
+
+    if fallbackUsed
+        selectedTable = sortrows(selectedTable, 'PeakPower_kW', 'descend');
+    else
+        selectedTable = sortrows(selectedTable, 'PvWindowMeanToPeakRatio', 'ascend');
+    end
+
+    fprintf('\nKirajzolasra kivalasztott profilok:\n');
+    disp(selectedTable);
+
+    %% 11. Profilok kirajzolasa
+
+    if fallbackUsed
+        plotSelectedProfiles( ...
+            dailyProfiles, ...
+            timeOfDay, ...
+            customerNames, ...
+            selectedIdx, ...
+            summaryTable, ...
+            maxProfilesPerFigure, ...
+            pvProductionStartHour, ...
+            pvProductionEndHour, ...
+            'Osszes ervenyes fogyasztasi profil', ...
+            false);
+    else
+        plotSelectedProfiles( ...
+            dailyProfiles, ...
+            timeOfDay, ...
+            customerNames, ...
+            selectedIdx, ...
+            summaryTable, ...
+            maxProfilesPerFigure, ...
+            pvProductionStartHour, ...
+            pvProductionEndHour, ...
+            'Ipari profilok alacsony PV-idoszaki fogyasztassal', ...
+            true);
+    end
+
+    plotSelectedMeanProfile( ...
         dailyProfiles, ...
         timeOfDay, ...
-        customerNames, ...
-        category, ...
-        summaryTable, ...
-        maxProfilesPerFigure);
+        selectedIdx, ...
+        pvProductionStartHour, ...
+        pvProductionEndHour, ...
+        fallbackUsed);
 
-    %% 10. Kategoriaatlagok egy kozos abran
-
-    plotCategoryMeanProfiles(dailyProfiles, timeOfDay, category);
-
-    %% 11. Kimenet
+    %% 12. Kimenet
 
     result = struct();
+
+    result.sourceFile = txtFilePath;
+    result.inputFolderPath = inputFolderPath;
+    result.functionFolderPath = functionFolderPath;
 
     result.time = time;
     result.power_kW = P;
     result.customerNames = customerNames;
     result.category = category;
+
     result.summaryTable = summaryTable;
+
+    result.selectedIdx = selectedIdx;
+    result.selectedTable = selectedTable;
+    result.selectedProfiles = dailyProfiles(:, selectedIdx);
+    result.selectedCustomerNames = customerNames(selectedIdx);
+    result.fallbackUsed = fallbackUsed;
+
     result.dailyProfiles = dailyProfiles;
     result.timeOfDay = timeOfDay;
     result.dt_h = dt_h;
 
-    fprintf('Feldolgozas kesz.\n');
+    result.settings = struct();
+    result.settings.maxProfilesPerFigure = maxProfilesPerFigure;
+    result.settings.pvProductionStartHour = pvProductionStartHour;
+    result.settings.pvProductionEndHour = pvProductionEndHour;
+    result.settings.pvMeanToPeakLimit = pvMeanToPeakLimit;
 
+    fprintf('Feldolgozas kesz.\n');
 end
 
+
+% =========================================================================
+% SEGEDFUGGVENYEK
+% =========================================================================
 
 function tempFilePath = createDecimalDotCopy(inputFilePath)
 % CREATEDECIMALDOTCOPY
@@ -326,11 +486,11 @@ function tempFilePath = createDecimalDotCopy(inputFilePath)
 
     [~, fileName, fileExt] = fileparts(char(inputFilePath));
 
-    if strlength(fileExt) == 0
-        fileExt = ".txt";
+    if isempty(fileExt)
+        fileExt = '.txt';
     end
 
-    tempFilePath = fullfile(tempdir, [fileName '_decimaldot_tmp' char(fileExt)]);
+    tempFilePath = fullfile(tempdir, [fileName '_decimaldot_tmp' fileExt]);
 
     fin = fopen(inputFilePath, 'r');
 
@@ -358,7 +518,6 @@ function tempFilePath = createDecimalDotCopy(inputFilePath)
 
     fclose(fin);
     fclose(fout);
-
 end
 
 
@@ -369,7 +528,6 @@ function deleteTempFile(tempFilePath)
     if isfile(tempFilePath)
         delete(tempFilePath);
     end
-
 end
 
 
@@ -398,117 +556,204 @@ function avgProfile = calculateAverageDailyProfile(time, p, samplesPerDay)
             continue;
         end
 
-        profiles(:, d) = pDay;
+        profiles(:, d) = pDay(:);
     end
 
     avgProfile = mean(profiles, 2, 'omitnan');
-
 end
 
 
-function plotDailyProfilesByCategory(dailyProfiles, timeOfDay, customerNames, category, summaryTable, maxProfilesPerFigure)
-% PLOTDAILYPROFILESBYCATEGORY
-% Kategoriankent kirajzolja az atlagos napi fogyasztasi profilokat.
-% Egy abran legfeljebb maxProfilesPerFigure db fogyaszto szerepel.
+function plotSelectedProfiles(dailyProfiles, timeOfDay, customerNames, selectedIdx, summaryTable, ...
+    maxProfilesPerFigure, pvStartHour, pvEndHour, plotTitleBase, isIndustrySelection)
+% PLOTSELECTEDPROFILES
+%
+% Kirajzolja a kivalasztott atlagos napi profilokat.
+% Ha sok profil van, tobb figurara bontja.
 
-    categories = ["residential", "commercial", "industry"];
-
-    for k = 1:numel(categories)
-
-        catName = categories(k);
-        idxCat = find(category == catName);
-
-        if isempty(idxCat)
-            fprintf('Nincs fogyaszto ebben a kategoriaban: %s\n', catName);
-            continue;
-        end
-
-        % Rendezés atlagos napi energia szerint csokkeno sorrendbe,
-        % hogy az erosebb fogyasztok elore keruljenek.
-        catSummary = summaryTable(idxCat, :);
-        [~, sortIdx] = sort(catSummary.AvgDailyEnergy_kWh, 'descend');
-        idxCat = idxCat(sortIdx);
-
-        nCat = numel(idxCat);
-        nFigures = ceil(nCat / maxProfilesPerFigure);
-
-        fprintf('%s kategoria: %d fogyaszto, %d abra\n', ...
-            upper(catName), nCat, nFigures);
-
-        for figIdx = 1:nFigures
-
-            startIdx = (figIdx - 1) * maxProfilesPerFigure + 1;
-            endIdx = min(figIdx * maxProfilesPerFigure, nCat);
-
-            selectedIdx = idxCat(startIdx:endIdx);
-
-            selectedProfiles = dailyProfiles(:, selectedIdx);
-            selectedNames = customerNames(selectedIdx);
-
-            figure('Color', 'w', ...
-                   'Name', sprintf('%s profiles %d of %d', upper(catName), figIdx, nFigures));
-
-            hold on;
-            grid on;
-
-            % Egyedi napi profilok.
-            plot(timeOfDay, selectedProfiles, 'LineWidth', 0.8);
-
-            % Az adott abran szereplo profilok atlaga.
-            meanProfile = mean(selectedProfiles, 2, 'omitnan');
-            plot(timeOfDay, meanProfile, 'k', 'LineWidth', 3);
-
-            xlabel('Napon beluli ido');
-            ylabel('Atlagos teljesitmeny [kW]');
-
-            title(sprintf('%s jellegu fogyasztok napi atlagprofiljai - %d/%d. abra', ...
-                upper(catName), figIdx, nFigures));
-
-            % Ha keves profil van, kiirjuk a fogyasztoneveket.
-            % 50 profilnal a teljes legenda mar olvashatatlan lenne.
-            if numel(selectedIdx) <= 10
-                legend([selectedNames(:); "Atlag"], 'Location', 'best');
-            else
-                legend('Egyedi napi profilok', 'Atlag', 'Location', 'best');
-            end
-
-            hold off;
-        end
+    if isempty(selectedIdx)
+        fprintf('Nincs kirajzolhato profil.\n');
+        return;
     end
 
+    selectedSummary = summaryTable(selectedIdx, :);
+
+    if isIndustrySelection
+        [~, sortIdx] = sort(selectedSummary.PvWindowMeanToPeakRatio, 'ascend');
+    else
+        [~, sortIdx] = sort(selectedSummary.PeakPower_kW, 'descend');
+    end
+
+    selectedIdx = selectedIdx(sortIdx);
+
+    nSelected = numel(selectedIdx);
+    nFigures = ceil(nSelected / maxProfilesPerFigure);
+
+    fprintf('Kirajzolando profilok szama: %d, figurak szama: %d\n', ...
+        nSelected, nFigures);
+
+    for figIdx = 1:nFigures
+
+        startIdx = (figIdx - 1) * maxProfilesPerFigure + 1;
+        endIdx = min(figIdx * maxProfilesPerFigure, nSelected);
+
+        idxThisFigure = selectedIdx(startIdx:endIdx);
+
+        selectedProfiles = dailyProfiles(:, idxThisFigure);
+        selectedNames = customerNames(idxThisFigure);
+
+        fig = figure('Color', 'w', ...
+            'Name', sprintf('%s - %d of %d', plotTitleBase, figIdx, nFigures));
+
+        hold on;
+        grid on;
+
+        % PV-termelesi idoszak hatterkiemelese.
+        yLimitsInitial = [0, max(selectedProfiles, [], 'all', 'omitnan') * 1.10];
+
+        if ~all(isfinite(yLimitsInitial)) || yLimitsInitial(2) <= 0
+            yLimitsInitial = [0, 1];
+        end
+
+        pvStartDuration = duration(floor(pvStartHour), ...
+            round((pvStartHour - floor(pvStartHour)) * 60), 0);
+
+        pvEndDuration = duration(floor(pvEndHour), ...
+            round((pvEndHour - floor(pvEndHour)) * 60), 0);
+
+        patch([pvStartDuration pvEndDuration pvEndDuration pvStartDuration], ...
+              [yLimitsInitial(1) yLimitsInitial(1) yLimitsInitial(2) yLimitsInitial(2)], ...
+              [0.90 0.90 0.90], ...
+              'EdgeColor', 'none', ...
+              'FaceAlpha', 0.35, ...
+              'DisplayName', 'PV-termelesi idoszak');
+
+        % Egyedi napi profilok.
+        plot(timeOfDay, selectedProfiles, 'LineWidth', 0.8);
+
+        % Az adott abran szereplo profilok atlaga.
+        meanProfile = mean(selectedProfiles, 2, 'omitnan');
+        plot(timeOfDay, meanProfile, 'k', 'LineWidth', 3, ...
+            'DisplayName', 'Atlag');
+
+        xlabel('Napon beluli ido');
+        ylabel('Atlagos teljesitmeny [kW]');
+
+        title(sprintf('%s - %d/%d. abra', ...
+            plotTitleBase, figIdx, nFigures), ...
+            'Interpreter', 'none');
+
+        if numel(idxThisFigure) <= 10
+            legend(["PV-termelesi idoszak"; selectedNames(:); "Atlag"], ...
+                'Location', 'best');
+        else
+            legend('PV-termelesi idoszak', 'Egyedi napi profilok', 'Atlag', ...
+                'Location', 'best');
+        end
+
+        ylim(yLimitsInitial);
+        hold off;
+    end
 end
 
 
-function plotCategoryMeanProfiles(dailyProfiles, timeOfDay, category)
-% PLOTCATEGORYMEANPROFILES
-% Egy kozos abran kirajzolja a kategoriak atlagos napi profiljait.
+function plotSelectedMeanProfile(dailyProfiles, timeOfDay, selectedIdx, pvStartHour, pvEndHour, fallbackUsed)
+% PLOTSELECTEDMEANPROFILE
+%
+% Egy kulon abran kirajzolja a kivalasztott profilok atlagat,
+% minimumat es maximumat.
 
-    categories = ["residential", "commercial", "industry"];
+    if isempty(selectedIdx)
+        return;
+    end
 
-    figure('Color', 'w', 'Name', 'Category mean profiles');
+    selectedProfiles = dailyProfiles(:, selectedIdx);
+
+    meanProfile = mean(selectedProfiles, 2, 'omitnan');
+    minProfile = min(selectedProfiles, [], 2, 'omitnan');
+    maxProfile = max(selectedProfiles, [], 2, 'omitnan');
+
+    fig = figure('Color', 'w', ...
+        'Name', 'Selected mean profile');
 
     hold on;
     grid on;
 
-    for k = 1:numel(categories)
+    yLimitsInitial = [0, max(maxProfile, [], 'omitnan') * 1.10];
 
-        catName = categories(k);
-        idx = category == catName;
-
-        if any(idx)
-            meanProfile = mean(dailyProfiles(:, idx), 2, 'omitnan');
-
-            plot(timeOfDay, meanProfile, ...
-                'LineWidth', 2.5, ...
-                'DisplayName', upper(catName));
-        end
+    if ~all(isfinite(yLimitsInitial)) || yLimitsInitial(2) <= 0
+        yLimitsInitial = [0, 1];
     end
+
+    pvStartDuration = duration(floor(pvStartHour), ...
+        round((pvStartHour - floor(pvStartHour)) * 60), 0);
+
+    pvEndDuration = duration(floor(pvEndHour), ...
+        round((pvEndHour - floor(pvEndHour)) * 60), 0);
+
+    patch([pvStartDuration pvEndDuration pvEndDuration pvStartDuration], ...
+          [yLimitsInitial(1) yLimitsInitial(1) yLimitsInitial(2) yLimitsInitial(2)], ...
+          [0.90 0.90 0.90], ...
+          'EdgeColor', 'none', ...
+          'FaceAlpha', 0.35, ...
+          'DisplayName', 'PV-termelesi idoszak');
+
+    plot(timeOfDay, minProfile, '--', 'LineWidth', 1.2, ...
+        'DisplayName', 'Minimum profil');
+
+    plot(timeOfDay, maxProfile, '--', 'LineWidth', 1.2, ...
+        'DisplayName', 'Maximum profil');
+
+    plot(timeOfDay, meanProfile, 'k', 'LineWidth', 3, ...
+        'DisplayName', 'Atlagos profil');
 
     xlabel('Napon beluli ido');
     ylabel('Atlagos teljesitmeny [kW]');
-    title('Kategoriak atlagos napi fogyasztasi profiljainak osszehasonlitasa');
+
+    if fallbackUsed
+        title(sprintf('Osszes ervenyes fogyasztasi profil atlaga, n = %d', ...
+            numel(selectedIdx)));
+    else
+        title(sprintf('Kivalasztott ipari profilok atlaga, n = %d', ...
+            numel(selectedIdx)));
+    end
+
     legend('Location', 'best');
+    ylim(yLimitsInitial);
 
     hold off;
+end
 
+
+function q = localPercentile(x, p)
+% LOCALPERCENTILE
+% Toolbox fuggetlen percentilis szamitas.
+%
+% x : vektor
+% p : percentilis 0...100 kozott
+
+    x = x(:);
+    x = x(~isnan(x));
+
+    if isempty(x)
+        q = NaN;
+        return;
+    end
+
+    x = sort(x);
+
+    if numel(x) == 1
+        q = x;
+        return;
+    end
+
+    pos = 1 + (p / 100) * (numel(x) - 1);
+    lo = floor(pos);
+    hi = ceil(pos);
+
+    if lo == hi
+        q = x(lo);
+    else
+        w = pos - lo;
+        q = (1 - w) * x(lo) + w * x(hi);
+    end
 end

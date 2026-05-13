@@ -20,6 +20,8 @@ function cfg = create_configurations(basePath)
     % "ac" = AC-csatolt PV+BESS
     cfg.system.bessCoupling = "dc";
 
+    cfg.loadScale = 1.0;
+
     % ---------------------------------------------------------------------
     % Grid connection
     % ---------------------------------------------------------------------
@@ -42,11 +44,11 @@ function cfg = create_configurations(basePath)
     %Costs
     cfg.cost.eur_to_huf = 350;
     % cfg.cost.pv_huf_per_kWp = cfg.cost.eur_to_huf*500;
-    cfg.cost.bess_huf_per_kWh = cfg.cost.eur_to_huf * 320;
+    cfg.cost.bess_huf_per_kWh = cfg.cost.eur_to_huf * 220;
     cfg.cost.pv_huf_per_kWp = 250000;
     %cfg.cost.bess_huf_per_kWh = 80000;
     cfg.cost.bess_power_huf_per_kW = 0;
-    cfg.cost.inverter_huf_per_kW = 50000;
+    cfg.cost.inverter_huf_per_kW = 40000;
 
     cfg.cost.pv_opex_frac_per_year = 0.015;
     cfg.cost.bess_opex_frac_per_year = 0.020;
@@ -87,12 +89,12 @@ function cfg = create_configurations(basePath)
     % ---------------------------------------------------------------------
     cfg.candidates.PV_kW_base = 500;
 
-    cfg.candidates.DCAC_ratio_vec = 1:1.0:3;
+    cfg.candidates.DCAC_ratio_vec = 1:0.5:3;
     
 
     % kWh/kWp jellegu arany:
     % pelda: 1.2 * 500 kW = 600 kWh
-    cfg.candidates.BESS_PV_vec = 0:1.0:6;
+    cfg.candidates.BESS_PV_vec = 0:0.5:3;
 
     % Plusz inverter-meret ciklus.
     % Ezeket a candidate database kulon ciklusban jarja be.
@@ -217,19 +219,37 @@ function cfg = create_configurations(basePath)
     % Ha true: minden implementalt mutato kap 3D scatter + heatmap abrat
     cfg.evaluation.plotAllMetricMaps = false;
 
+    
     % ---------------------------------------------------------------------
-    % Diagnostics / algorithm verification template
+    % Diagnostics / test mode
     % ---------------------------------------------------------------------
-    % Alapertelmezetten nem fut a main reszekent. Kezi ellenorzeshez:
-    %   diagnostics = run_simulation_diagnostics(cfg);
-    % vagy allitsd cfg.diagnostics.enabled = true ertekre ebben a konfiguracioban.
-    cfg.diagnostics.enabled = true;
-    cfg.diagnostics.makePlots = true;
-    cfg.diagnostics.figureVisible = "off";
-    cfg.diagnostics.nDays = 3;
-    cfg.diagnostics.dt_h = 0.25;
-    cfg.diagnostics.couplings = ["dc", "ac"];
+    cfg.diagnostics = struct();
 
+    % Ha true, akkor nem futtatja az osszes candidate-et,
+    % csak a megadott candidateIndex-et, de azt teljes idotavra.
+    cfg.diagnostics.testMode = false;
+
+    % Ezt allitsd arra a candidate-re, amit vizsgalni akarsz.
+    % Pelda: 2 = a riportban szereplo kis BESS-es rendszer.
+    cfg.diagnostics.candidateIndex = 2;
+
+    % Teljes idosor mentese diagnosztikahoz.
+    cfg.diagnostics.saveFullTimeSeries = true;
+
+    % Napi abrak. Ha ures, automatikusan valaszt problematikus napokat.
+    cfg.diagnostics.plotDayIndices = [];
+
+    % Heti abrak. Ha ures, automatikusan valaszt problematikus hetet.
+    cfg.diagnostics.plotWeekStartDays = [];
+
+    % Kimeneti mappa.
+    cfg.diagnostics.outputFolder = fullfile(cfg.paths.results, 'diagnostics');
+
+    % SoC tolerancia a hibadetektalashoz.
+    cfg.diagnostics.socTolerance = 0.02;
+
+    % Minimum elvart ciklusszam csak figyelmezteteshez.
+    cfg.diagnostics.expectedCycleWarningRatio = 0.30;
     % ---------------------------------------------------------------------
     % OUTPUT METRICS - SCALAR
     % ---------------------------------------------------------------------
