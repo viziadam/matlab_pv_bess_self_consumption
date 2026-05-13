@@ -24,24 +24,24 @@ function DB =  main()
 
     cfg = create_configurations(basePath);
 
-    [analysisResult, cfg] = analyze_load_profiles(cfg);
-    % cfg.candidates.P_inv_kW_vec = [200, 250, 300, 400];
-    disp(cfg.candidates.P_inv_kW_vec);
-
-    data = build_data(cfg);
-
-    cfg.diagnostics.testMode = false;
-    cfg.diagnostics.candidateIndex = 14;
-
-    DB = init_candidate_database_structures(data, cfg);
-
-    DB = simulate_candidates_database(data, DB, cfg);
-
-    save_candidates_database(DB, cfg);
-
-    fprintf('\nOff-grid candidate database simulation finished.\n');
-    fprintf('Candidates: %d\n', height(DB.candidateTable));
-    fprintf('Saved to: %s\n', fullfile(cfg.paths.results, 'offgrid_candidate_database.mat'));
+    % [analysisResult, cfg] = analyze_load_profiles(cfg);
+    % % cfg.candidates.P_inv_kW_vec = [200, 250, 300, 400];
+    % disp(cfg.candidates.P_inv_kW_vec);
+    % 
+    % data = build_data(cfg);
+    % 
+    % cfg.diagnostics.testMode = false;
+    % cfg.diagnostics.candidateIndex = 14;
+    % 
+    % DB = init_candidate_database_structures(data, cfg);
+    % 
+    % DB = simulate_candidates_database(data, DB, cfg);
+    % 
+    % save_candidates_database(DB, cfg);
+    % 
+    % fprintf('\nOff-grid candidate database simulation finished.\n');
+    % fprintf('Candidates: %d\n', height(DB.candidateTable));
+    % fprintf('Saved to: %s\n', fullfile(cfg.paths.results, 'offgrid_candidate_database.mat'));
 
     evalCfg = create_evaluation_config(cfg);
     evaluationResult = evaluation(cfg, evalCfg);
