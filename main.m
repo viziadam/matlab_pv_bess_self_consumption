@@ -1,58 +1,123 @@
-function DB =  main()
-% RUN_OFFGRID_CONFIGURATION_DATABASE_CASE2
+function results = main(runMode)
+% MAIN
 %
-% Fo futtato fuggveny az off-grid PV+BESS+diesel konfiguracios
-% adatbazis letrehozasahoz.
+% Fo futtato fuggveny a grid-connected PV+BESS self-consumption
+% esettanulmanyhoz.
 %
-% Bemenet:
-%   data.days(d).date
-%   data.days(d).P_load_kW
-%   data.days(d).P_pv_base_kW
-%   data.days(d).dt_h
+% Alap mukodes:
+%   results = main()
 %
-% Kimenet:
-%   DB : kozponti MATLAB strukturalt adatbazis
+% Ez lefuttatja:
+%   1) fogyasztasi/PV elozetes elemzes es inverter candidate meghatarozas,
+%   2) DC-csatolt candidate sweep,
+%   3) AC-csatolt candidate sweep,
+%   4) AC/DC osszesito evaluation.
 %
-% Fontos:
-%   - nincs napi tabla
-%   - nincs teljes idosor mentes
-%   - csak candidate-szintu skalark es aggregalt napon beluli profilok mentodnek
+% Gyorsabb hasznalatok:
+%   results = main("evaluateOnly")
+%       Csak a mar letezo results_dccoupled.mat es results_accoupled.mat
+%       alapjan keszit AC/DC osszesito kiertekelest.
+%
+%   results = main("dcOnly")
+%       Csak DC szimulaciot futtat es kulon DC evaluation-t keszit.
+%
+%   results = main("acOnly")
+%       Csak AC szimulaciot futtat es kulon AC evaluation-t keszit.
+
+    if nargin < 1 || isempty(runMode)
+        runMode = "full";
+    end
+
+    runMode = lower(string(runMode));
 
     clc;
     close all;
-    basePath = fileparts(mfilename('fullpath'));
 
+    basePath = fileparts(mfilename('fullpath'));
     cfg = create_configurations(basePath);
 
-    % [analysisResult, cfg] = analyze_load_profiles(cfg);
-    % % cfg.candidates.P_inv_kW_vec = [200, 250, 300, 400];
-    % disp(cfg.candidates.P_inv_kW_vec);
-    % 
-    % data = build_data(cfg);
-    % 
-    % cfg.diagnostics.testMode = false;
-    % cfg.diagnostics.candidateIndex = 14;
-    % 
-    % DB = init_candidate_database_structures(data, cfg);
-    % 
-    % DB = simulate_candidates_database(data, DB, cfg);
-    % 
-    % save_candidates_database(DB, cfg);
-    % 
-    % fprintf('\nOff-grid candidate database simulation finished.\n');
-    % fprintf('Candidates: %d\n', height(DB.candidateTable));
-    % fprintf('Saved to: %s\n', fullfile(cfg.paths.results, 'offgrid_candidate_database.mat'));
+    results = struct();
+    results.cfgInitial = cfg;
 
-    evalCfg = create_evaluation_config(cfg);
-    evaluationResult = evaluation(cfg, evalCfg);
+    switch runMode
 
-    % if isfield(cfg, 'diagnostics') && isfield(cfg.diagnostics, 'enabled') && ...
-    %    cfg.diagnostics.enabled
-    %    DB.diagnostics = run_simulation_diagnostics(cfg, cfg.diagnostics);
-    % end
+        case "full"
+            [analysisResult, cfg] = analyze_load_profiles(cfg);
+            data = build_data(cfg);
+
+            results.analysisResult = analysisResult;
+            results.dcDB = local_run_coupled_simulation(data, cfg, "dc");
+            results.acDB = local_run_coupled_simulation(data, cfg, "ac");
+            results.acdcEvaluation = evaluation_acdc_summary(cfg);
+
+        case "evaluateonly"
+            results.acdcEvaluation = evaluation_acdc_summary(cfg);
+
+        case "dconly"
+            [analysisResult, cfg] = analyze_load_profiles(cfg);
+            data = build_data(cfg);
+
+            results.analysisResult = analysisResult;
+            results.dcDB = local_run_coupled_simulation(data, cfg, "dc");
+            results.dcEvaluation = local_run_single_evaluation(cfg, "dc");
+
+        case "aconly"
+            [analysisResult, cfg] = analyze_load_profiles(cfg);
+            data = build_data(cfg);
+
+            results.analysisResult = analysisResult;
+            results.acDB = local_run_coupled_simulation(data, cfg, "ac");
+            results.acEvaluation = local_run_single_evaluation(cfg, "ac");
+
+        otherwise
+            error('Unknown runMode: %s. Use "full", "evaluateOnly", "dcOnly" or "acOnly".', runMode);
+    end
+
+    results.cfgFinal = cfg;
+end
 
 
+% =========================================================================
+% SIMULATION HELPERS
+% =========================================================================
+function DB = local_run_coupled_simulation(data, cfg, coupling)
+
+    cfgRun = cfg;
+    cfgRun.system.bessCoupling = coupling;
+
+    if isfield(cfgRun, 'diagnostics') && isfield(cfgRun.diagnostics, 'testMode')
+        cfgRun.diagnostics.testMode = false;
+    end
+
+    fprintf('\n============================================================\n');
+    fprintf('Running %s-coupled candidate simulation.\n', upper(char(coupling)));
+    fprintf('============================================================\n\n');
+
+    DB = init_candidate_database_structures(data, cfgRun);
+    DB = simulate_candidates_database(data, DB, cfgRun);
+    save_candidates_database(DB, cfgRun);
+
+    fprintf('\n%s-coupled candidate database simulation finished.\n', upper(char(coupling)));
+    fprintf('Candidates: %d\n', height(DB.candidateTable));
+end
 
 
+function evaluationResult = local_run_single_evaluation(cfg, coupling)
 
+    cfgEval = cfg;
+    cfgEval.system.bessCoupling = coupling;
+
+    evalCfg = create_evaluation_config(cfgEval);
+
+    switch string(coupling)
+        case "dc"
+            evalCfg.input.resultFilePath = fullfile(cfg.paths.results, 'results_dccoupled.mat');
+        case "ac"
+            evalCfg.input.resultFilePath = fullfile(cfg.paths.results, 'results_accoupled.mat');
+        otherwise
+            error('Unknown coupling: %s', string(coupling));
+    end
+
+    evalCfg.output.baseFolder = fullfile(cfg.paths.figures, 'evaluation', char(coupling));
+    evaluationResult = evaluation(cfgEval, evalCfg);
 end
