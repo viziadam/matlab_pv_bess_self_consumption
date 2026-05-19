@@ -1,11 +1,10 @@
 function acdcResult = fix_acdc_lcoe_outputs(acdcResult)
 % FIX_ACDC_LCOE_OUTPUTS
 %
-% Vegso fajlagos hasznos AC energia mutato javitas az AC/DC osszesito
-% riporthoz.
+% Vegso LCOE javitas az AC/DC osszesito riporthoz.
 %
-% A feladat szerinti definicio:
-%   mutato = rendszer altal szolgaltatott AC energia / (sumCAPEX + sumOPEX)
+% Definicio:
+%   LCOE = (sumCAPEX + sumOPEX) / rendszer altal szolgaltatott AC energia
 %
 % ahol a szimulalt idoszakra vett koltseg:
 %   sumCAPEX + sumOPEX =
@@ -22,10 +21,10 @@ function acdcResult = fix_acdc_lcoe_outputs(acdcResult)
 % Szolgaltatott AC energia:
 %   PV -> load + BESS -> load
 %
-% A mutato mertekegysege a riportban:
-%   MWh / millio Ft
+% Mertekegyseg:
+%   Ft/kWh
 %
-% Minel nagyobb ez az ertek, annal jobb. Ezert a heatmap a maximumot jeloli.
+% Minel kisebb ez az ertek, annal jobb. Ezert a heatmap a minimumot jeloli.
 
     if nargin < 1 || isempty(acdcResult)
         error('acdcResult input is required.');
@@ -40,24 +39,23 @@ function acdcResult = fix_acdc_lcoe_outputs(acdcResult)
     end
 
     T = acdcResult.combinedTable;
-
     T = local_ensure_required_period_fields(T);
 
-    periodCost_millionHUF = T.reportPeriodInvestmentCost_HUF ./ 1e6;
-    usefulACEnergy_MWh = T.reportUsefulACEnergy_MWh;
+    usefulACEnergy_kWh = T.reportUsefulACEnergy_MWh .* 1000;
 
-    % Ez az altalad kert irany: energia / koltseg.
+    % Klasszikus LCOE irany: koltseg / energia [Ft/kWh].
+    T.LCOE_system_HUF_per_kWh = local_safe_divide( ...
+        T.reportPeriodInvestmentCost_HUF, ...
+        usefulACEnergy_kWh);
+
+    % Kompatibilitasi okbol a korabbi LCOE mezoket is erre irjuk at.
+    T.LCOE_usefulPV_HUF_per_kWh = T.LCOE_system_HUF_per_kWh;
+    T.LCOE_HUF_per_kWh = T.LCOE_system_HUF_per_kWh;
+
+    % A korabbi forditott mutato csak ellenorzeshez marad meg kulon neven.
     T.ACEnergyPerCost_MWh_per_millionHUF = local_safe_divide( ...
-        usefulACEnergy_MWh, ...
-        periodCost_millionHUF);
-
-    % A regi LCOE mezoket szandekosan felulirjuk, hogy a heatmapek es a
-    % tablazatok ne a korabbi koltseg/energia definiciot hasznaljak.
-    % Itt a nev kompatibilitasi okbol marad LCOE, de a tartalom:
-    % hasznositott AC energia / periodus koltseg.
-    T.LCOE_system_HUF_per_kWh = T.ACEnergyPerCost_MWh_per_millionHUF;
-    T.LCOE_usefulPV_HUF_per_kWh = T.ACEnergyPerCost_MWh_per_millionHUF;
-    T.LCOE_HUF_per_kWh = T.ACEnergyPerCost_MWh_per_millionHUF;
+        T.reportUsefulACEnergy_MWh, ...
+        T.reportPeriodInvestmentCost_HUF ./ 1e6);
 
     acdcResult.combinedTable = T;
 
@@ -92,12 +90,12 @@ function acdcResult = fix_acdc_lcoe_outputs(acdcResult)
     local_plot_min_inverter_lcoe_heatmap(T, figureFolder);
 
     acdcResult.lcoeDefinition = ...
-        "ACEnergyPerCost_MWh_per_millionHUF = (pvToLoad_kWh + bessToLoad_kWh)/1000 / (sumCAPEX_plus_sumOPEX_HUF/1e6), where BESS CAPEX = (1-finalSoH)/0.2*CapexBESS";
+        "LCOE_system_HUF_per_kWh = sumCAPEX_plus_sumOPEX_HUF / (pvToLoad_kWh + bessToLoad_kWh), where BESS degradation CAPEX = (1-finalSoH)/0.2*CapexBESS";
 
     save(fullfile(outputFolder, 'evaluation_acdc_summary_result.mat'), ...
         'acdcResult', '-v7.3');
 
-    fprintf('\nAC/DC useful AC energy per period cost recalculated.\n');
+    fprintf('\nAC/DC LCOE recalculated as period cost per useful AC energy.\n');
 end
 
 
@@ -164,16 +162,16 @@ end
 
 function selectedTable = local_refresh_selected_table(selectedTable, combinedTable)
 
-    if ~ismember('ACEnergyPerCost_MWh_per_millionHUF', selectedTable.Properties.VariableNames)
-        selectedTable.ACEnergyPerCost_MWh_per_millionHUF = NaN(height(selectedTable), 1);
-    end
-
     if ~ismember('LCOE_system_HUF_per_kWh', selectedTable.Properties.VariableNames)
         selectedTable.LCOE_system_HUF_per_kWh = NaN(height(selectedTable), 1);
     end
 
     if ~ismember('LCOE_HUF_per_kWh', selectedTable.Properties.VariableNames)
         selectedTable.LCOE_HUF_per_kWh = NaN(height(selectedTable), 1);
+    end
+
+    if ~ismember('ACEnergyPerCost_MWh_per_millionHUF', selectedTable.Properties.VariableNames)
+        selectedTable.ACEnergyPerCost_MWh_per_millionHUF = NaN(height(selectedTable), 1);
     end
 
     for i = 1:height(selectedTable)
@@ -186,39 +184,40 @@ function selectedTable = local_refresh_selected_table(selectedTable, combinedTab
             continue;
         end
 
-        value = combinedTable.ACEnergyPerCost_MWh_per_millionHUF(idx);
+        lcoeValue = combinedTable.LCOE_system_HUF_per_kWh(idx);
+        energyPerCostValue = combinedTable.ACEnergyPerCost_MWh_per_millionHUF(idx);
 
-        selectedTable.ACEnergyPerCost_MWh_per_millionHUF(i) = value;
-        selectedTable.LCOE_system_HUF_per_kWh(i) = value;
+        selectedTable.LCOE_system_HUF_per_kWh(i) = lcoeValue;
+        selectedTable.LCOE_HUF_per_kWh(i) = lcoeValue;
+        selectedTable.ACEnergyPerCost_MWh_per_millionHUF(i) = energyPerCostValue;
 
         if ismember('LCOE_usefulPV_HUF_per_kWh', selectedTable.Properties.VariableNames)
-            selectedTable.LCOE_usefulPV_HUF_per_kWh(i) = value;
+            selectedTable.LCOE_usefulPV_HUF_per_kWh(i) = lcoeValue;
         end
-
-        selectedTable.LCOE_HUF_per_kWh(i) = value;
     end
 end
 
 
 function S = local_update_selected_summary_lcoe(S, selectedTable)
 
-    values = selectedTable.ACEnergyPerCost_MWh_per_millionHUF;
+    lcoeValues = selectedTable.LCOE_system_HUF_per_kWh;
+    energyPerCostValues = selectedTable.ACEnergyPerCost_MWh_per_millionHUF;
 
-    S.ACEnergyPerCost_MWh_per_millionHUF = values;
-    S.LCOE_system_HUF_per_kWh = values;
+    S.LCOE_system_HUF_per_kWh = lcoeValues;
+    S.ACEnergyPerCost_MWh_per_millionHUF = energyPerCostValues;
 
     if ismember('LCOE_usefulPV_HUF_per_kWh', S.Properties.VariableNames)
-        S.LCOE_usefulPV_HUF_per_kWh = values;
+        S.LCOE_usefulPV_HUF_per_kWh = lcoeValues;
     end
 end
 
 
 function local_plot_min_inverter_lcoe_heatmap(T, figureFolder)
 
-    metricField = 'ACEnergyPerCost_MWh_per_millionHUF';
-    metricLabel = 'Hasznos AC energia / periodus koltseg';
-    metricUnit = 'MWh/millio Ft';
-    direction = 'max';
+    metricField = 'LCOE_system_HUF_per_kWh';
+    metricLabel = 'LCOE - periodus koltseg / hasznos AC energia';
+    metricUnit = 'Ft/kWh';
+    direction = 'min';
 
     valid = logical(T.wasSimulated) & ~logical(T.hasError) & ...
         isfinite(T.P_inv_kW) & isfinite(T.DCAC_ratio) & ...
@@ -226,7 +225,7 @@ function local_plot_min_inverter_lcoe_heatmap(T, figureFolder)
 
     if ~any(valid)
         warning('fix_acdc_lcoe_outputs:noValidData', ...
-            'No valid data for corrected AC energy per cost heatmap.');
+            'No valid data for corrected LCOE heatmap.');
         return;
     end
 
@@ -243,7 +242,7 @@ function local_plot_min_inverter_lcoe_heatmap(T, figureFolder)
 
     if isempty(xVals) || isempty(yVals) || isempty(metricValues)
         warning('fix_acdc_lcoe_outputs:noHeatmapData', ...
-            'No common min-inverter data for corrected AC energy per cost heatmap.');
+            'No common min-inverter data for corrected LCOE heatmap.');
         return;
     end
 
@@ -256,7 +255,7 @@ function local_plot_min_inverter_lcoe_heatmap(T, figureFolder)
         cMax = cMax + delta;
     end
 
-    fig = figure('Name', 'Heatmap min inverter - useful AC energy per cost', ...
+    fig = figure('Name', 'Heatmap min inverter - corrected LCOE', ...
         'Position', [80, 80, 1450, 650]);
 
     tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
