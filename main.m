@@ -12,8 +12,8 @@ function results = main(runMode)
 %   2) DC-csatolt candidate sweep,
 %   3) AC-csatolt candidate sweep,
 %   4) AC/DC osszesito evaluation,
-%   5) AC/DC osszesito utolagos javitasa: periodus NPV, helyes feliratok,
-%      legkisebb invertermeretes heatmapek.
+%   5) vegleges AC/DC riportgeneralas: periodus NPV, helyes feliratok,
+%      osszehasonlithato heatmapek.
 %
 % Gyorsabb hasznalatok:
 %   results = main("evaluateOnly")
@@ -107,7 +107,13 @@ end
 function acdcEvaluation = local_run_acdc_evaluation(cfg)
 
     acdcEvaluation = evaluation_acdc_summary(cfg);
+
+    % A postprocess megtartja/frissiti a tablazatos eredmenyeket, a finalizer
+    % pedig bezarja a regi nyitott abrakat es csak a vegleges riportfigurakat
+    % generalja ujra: jo x tengely feliratok, szimulalt idoszakra vett NPV,
+    % kozos DC/AC heatmap tartomanyok.
     acdcEvaluation = postprocess_acdc_summary_outputs(acdcEvaluation, cfg);
+    acdcEvaluation = finalize_acdc_summary_outputs(acdcEvaluation, cfg);
 end
 
 
