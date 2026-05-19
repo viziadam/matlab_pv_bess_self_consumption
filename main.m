@@ -13,7 +13,8 @@ function results = main(runMode)
 %   3) AC-csatolt candidate sweep,
 %   4) AC/DC osszesito evaluation,
 %   5) vegleges AC/DC riportgeneralas: periodus NPV, helyes feliratok,
-%      osszehasonlithato heatmapek.
+%      osszehasonlithato heatmapek,
+%   6) LCOE javitas: periodus koltseg / hasznositott AC energia.
 %
 % Gyorsabb hasznalatok:
 %   results = main("evaluateOnly")
@@ -111,9 +112,11 @@ function acdcEvaluation = local_run_acdc_evaluation(cfg)
     % A postprocess megtartja/frissiti a tablazatos eredmenyeket, a finalizer
     % pedig bezarja a regi nyitott abrakat es csak a vegleges riportfigurakat
     % generalja ujra: jo x tengely feliratok, szimulalt idoszakra vett NPV,
-    % kozos DC/AC heatmap tartomanyok.
+    % kozos DC/AC heatmap tartomanyok. A legvegen az LCOE-t is ugyanarra a
+    % perioduskoltseg-alapra hozzuk, mint az NPV-t.
     acdcEvaluation = postprocess_acdc_summary_outputs(acdcEvaluation, cfg);
     acdcEvaluation = finalize_acdc_summary_outputs(acdcEvaluation, cfg);
+    acdcEvaluation = fix_acdc_lcoe_outputs(acdcEvaluation);
 end
 
 
