@@ -11,7 +11,9 @@ function results = main(runMode)
 %   1) fogyasztasi/PV elozetes elemzes es inverter candidate meghatarozas,
 %   2) DC-csatolt candidate sweep,
 %   3) AC-csatolt candidate sweep,
-%   4) AC/DC osszesito evaluation.
+%   4) AC/DC osszesito evaluation,
+%   5) AC/DC osszesito utolagos javitasa: periodus NPV, helyes feliratok,
+%      legkisebb invertermeretes heatmapek.
 %
 % Gyorsabb hasznalatok:
 %   results = main("evaluateOnly")
@@ -48,10 +50,10 @@ function results = main(runMode)
             results.analysisResult = analysisResult;
             results.dcDB = local_run_coupled_simulation(data, cfg, "dc");
             results.acDB = local_run_coupled_simulation(data, cfg, "ac");
-            results.acdcEvaluation = evaluation_acdc_summary(cfg);
+            results.acdcEvaluation = local_run_acdc_evaluation(cfg);
 
         case "evaluateonly"
-            results.acdcEvaluation = evaluation_acdc_summary(cfg);
+            results.acdcEvaluation = local_run_acdc_evaluation(cfg);
 
         case "dconly"
             [analysisResult, cfg] = analyze_load_profiles(cfg);
@@ -99,6 +101,13 @@ function DB = local_run_coupled_simulation(data, cfg, coupling)
 
     fprintf('\n%s-coupled candidate database simulation finished.\n', upper(char(coupling)));
     fprintf('Candidates: %d\n', height(DB.candidateTable));
+end
+
+
+function acdcEvaluation = local_run_acdc_evaluation(cfg)
+
+    acdcEvaluation = evaluation_acdc_summary(cfg);
+    acdcEvaluation = postprocess_acdc_summary_outputs(acdcEvaluation, cfg);
 end
 
 
