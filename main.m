@@ -48,10 +48,10 @@ function results = main(runMode)
             results.analysisResult = analysisResult;
             results.dcDB = local_run_coupled_simulation(data, cfg, "dc");
             results.acDB = local_run_coupled_simulation(data, cfg, "ac");
-            results.acdcEvaluation = local_run_acdc_summary(cfg);
+            results.acdcEvaluation = evaluation_acdc_summary(cfg);
 
         case "evaluateonly"
-            results.acdcEvaluation = local_run_acdc_summary(cfg);
+            results.acdcEvaluation = evaluation_acdc_summary(cfg);
 
         case "dconly"
             [analysisResult, cfg] = analyze_load_profiles(cfg);
@@ -99,18 +99,6 @@ function DB = local_run_coupled_simulation(data, cfg, coupling)
 
     fprintf('\n%s-coupled candidate database simulation finished.\n', upper(char(coupling)));
     fprintf('Candidates: %d\n', height(DB.candidateTable));
-end
-
-
-function acdcEvaluation = local_run_acdc_summary(cfg)
-
-    acdcEvaluation = evaluation_acdc_summary(cfg);
-
-    % A 3 paneles penzugyi AC/DC osszesito figure-t kibovitjuk egy 4. panellel:
-    % BESS-only hasznos AC energiaertek, BESS degradacios CAPEX es BESS OPEX
-    % a teljes szimulalt idoszakra. A helper ugyanarra a fajlnevve menti a
-    % bovített figure-t, ezert a riportban mar ez a verzio jelenik meg.
-    acdcEvaluation = add_bess_only_panel_to_acdc_summary(acdcEvaluation);
 end
 
 
