@@ -4,20 +4,17 @@ function acdcResult = evaluation_acdc_summary(cfg, options)
 % AC/DC osszesito kiertekeles a grid-connected PV+BESS self-consumption
 % esettanulmanyhoz.
 %
-% A fuggveny feltetelezi, hogy a kovetkezo ket szimulacios eredmeny mar letezik:
+% A fuggveny a ket mar lefutott eredmenyfajlt hasonlitja ossze:
 %   results/results_dccoupled.mat
 %   results/results_accoupled.mat
 %
-% Kimenetek:
-%   results/figures/evaluation_acdc/tables
-%   results/figures/evaluation_acdc/figures
-%
-% Fo abrak:
-%   - 3D LCSE scatter DC es AC esetre
-%   - 3D NPV scatter DC es AC esetre
-%   - 5 kivalasztott jelolt penzugyi value/cost/payback osszesitoje
-%   - 5 kivalasztott jelolt onfogyasztas/onellatas/ciklusszam osszesitoje
-%   - 5 kivalasztott jelolt hasznos AC energia + veszteseg bontasa
+% A regi single-topology evaluation abrakat alapertelmezetten nem generalja,
+% mert az AC/DC riportban csak az 5 kivalasztott jelolt szerepeljen:
+%   1) legjobb csak PV
+%   2) legjobb DC LCSE szerint
+%   3) legjobb DC NPV szerint
+%   4) legjobb AC LCSE szerint
+%   5) legjobb AC NPV szerint
 
     if nargin < 2 || isempty(options)
         options = struct();
@@ -53,27 +50,28 @@ function acdcResult = evaluation_acdc_summary(cfg, options)
 
     combinedTable = [dcTable; acTable];
 
-    selected = local_select_report_candidates(combinedTable, options);
+    selected = local_select_report_candidates(combinedTable);
     selectedTable = selected.table;
     selectedLabels = selected.labels;
     selectedShortLabels = selected.shortLabels;
 
     selectedSummaryTable = local_build_selected_summary_table(selectedTable, selectedLabels);
+    bessOnlyTable = local_build_bess_only_table(selectedTable, selectedLabels);
 
     % ---------------------------------------------------------------------
     % 3D LCSE / NPV abrak kulon DC es AC esetre
     % ---------------------------------------------------------------------
     local_plot_3d_metric(dcTable, 'LCSE_HUF_per_kWh_saved', ...
-        'LCSE - saved energy specific cost', 'HUF/kWh', 'min', figureFolder, 'dc');
+        'LCSE - megtakaritott energia fajlagos koltsege', 'Ft/kWh', 'min', figureFolder, 'dc');
 
     local_plot_3d_metric(dcTable, 'NPV_millionHUF', ...
-        'Net present value', 'million HUF', 'max', figureFolder, 'dc');
+        'Netto jelenertek', 'millio Ft', 'max', figureFolder, 'dc');
 
     local_plot_3d_metric(acTable, 'LCSE_HUF_per_kWh_saved', ...
-        'LCSE - saved energy specific cost', 'HUF/kWh', 'min', figureFolder, 'ac');
+        'LCSE - megtakaritott energia fajlagos koltsege', 'Ft/kWh', 'min', figureFolder, 'ac');
 
     local_plot_3d_metric(acTable, 'NPV_millionHUF', ...
-        'Net present value', 'million HUF', 'max', figureFolder, 'ac');
+        'Netto jelenertek', 'millio Ft', 'max', figureFolder, 'ac');
 
     % ---------------------------------------------------------------------
     % 5 jelolt osszesito abrak
@@ -87,6 +85,7 @@ function acdcResult = evaluation_acdc_summary(cfg, options)
     % ---------------------------------------------------------------------
     writetable(combinedTable, fullfile(tableFolder, 'acdc_combined_candidate_table.csv'));
     writetable(selectedSummaryTable, fullfile(tableFolder, 'acdc_selected_candidates_summary.csv'));
+    writetable(bessOnlyTable, fullfile(tableFolder, 'acdc_selected_bess_only_period_value_table.csv'));
 
     acdcResult = struct();
     acdcResult.createdAt = datetime('now');
@@ -96,6 +95,7 @@ function acdcResult = evaluation_acdc_summary(cfg, options)
     acdcResult.combinedTable = combinedTable;
     acdcResult.selectedTable = selectedTable;
     acdcResult.selectedSummaryTable = selectedSummaryTable;
+    acdcResult.selectedBessOnlyValueTable = bessOnlyTable;
     acdcResult.outputFolder = options.outputFolder;
 
     save(fullfile(options.outputFolder, 'evaluation_acdc_summary_result.mat'), ...
@@ -131,6 +131,12 @@ function options = local_default_options(cfg, options)
     if ~isfield(options, 'saveSingleTopologyEvaluationCsv')
         options.saveSingleTopologyEvaluationCsv = false;
     end
+
+    % Fontos: AC/DC osszesiteskor a regi 3 jeloltes single-topology abrakat
+    % nem kerjuk, mert zavaro x tengelyt es mas logikat adnak.
+    if ~isfield(options, 'makeSingleTopologyPlots')
+        options.makeSingleTopologyPlots = false;
+    end
 end
 
 
@@ -159,6 +165,8 @@ function [evaluationResult, T] = local_run_single_coupling_evaluation(cfg, coupl
         char(coupling));
 
     evalCfg.output.saveEvaluationCsv = options.saveSingleTopologyEvaluationCsv;
+    evalCfg.plots.makePlots = options.makeSingleTopologyPlots;
+    evalCfg.plots.make3DScatter = false;
 
     if ~isfile(evalCfg.input.resultFilePath)
         error(['Missing %s result file: %s\n', ...
@@ -187,77 +195,147 @@ function T = local_add_report_columns(T, evalCfg, cfg)
         error('evalCfg.economics.simYears must be positive.');
     end
 
-    T.reportDeltaSoH = max(0, 1 - T.finalSoH);
+    n = height(T);
 
-    T.reportAnnualPVCapex_HUF = T.capexPV_HUF ./ pvLifetime;
-    T.reportAnnualPVOpex_HUF = T.capexPV_HUF .* evalCfg.economics.pv_opex_frac_per_year;
+    finalSoH = local_col(T, 'finalSoH', ones(n, 1));
+    finalSoH(~isfinite(finalSoH)) = 1;
 
-    T.reportAnnualInverterCapex_HUF = T.capexInverter_HUF ./ inverterLifetime;
-    T.reportAnnualInverterOpex_HUF = T.capexInverter_HUF .* evalCfg.economics.inverter_opex_frac_per_year;
+    capexPV = local_col(T, 'capexPV_HUF', zeros(n, 1));
+    capexInv = local_col(T, 'capexInverter_HUF', zeros(n, 1));
+    capexBess = local_col(T, 'capexBESS_HUF', zeros(n, 1));
 
-    T.reportAnnualBessDegradation_HUF = ...
-        (T.reportDeltaSoH ./ 0.2) .* T.capexBESS_HUF ./ simYears;
+    hasBess = local_col(T, 'E_BESS_kWh', zeros(n, 1)) > 1e-9;
 
-    T.reportAnnualBessOpex_HUF = T.capexBESS_HUF .* evalCfg.economics.bess_opex_frac_per_year;
+    deltaSoH = max(0, 1 - finalSoH);
+    deltaSoH(~hasBess) = 0;
 
-    T.reportAnnualInvestmentCost_HUF = ...
-        T.reportAnnualPVCapex_HUF + ...
-        T.reportAnnualPVOpex_HUF + ...
-        T.reportAnnualInverterCapex_HUF + ...
-        T.reportAnnualInverterOpex_HUF + ...
-        T.reportAnnualBessDegradation_HUF + ...
-        T.reportAnnualBessOpex_HUF;
+    % ---------------------------------------------------------------------
+    % Periodusra vetitett rendszerkoltsegek
+    % ---------------------------------------------------------------------
+    T.reportSimYears = repmat(simYears, n, 1);
+    T.reportDeltaSoH = deltaSoH;
 
-    T.reportAnnualCostSaving_HUF = T.energyCostSavings_HUF ./ simYears;
+    T.reportPeriodPVCapex_HUF = capexPV ./ pvLifetime .* simYears;
+    T.reportPeriodPVOpex_HUF = capexPV .* evalCfg.economics.pv_opex_frac_per_year .* simYears;
 
-    if ismember('periodNetValue_HUF', T.Properties.VariableNames)
-        T.reportPeriodNetValue_HUF = T.periodNetValue_HUF;
-    else
-        T.reportPeriodNetValue_HUF = ...
-            T.energyCostSavings_HUF - T.reportAnnualInvestmentCost_HUF .* simYears;
+    T.reportPeriodInverterCapex_HUF = capexInv ./ inverterLifetime .* simYears;
+    T.reportPeriodInverterOpex_HUF = capexInv .* evalCfg.economics.inverter_opex_frac_per_year .* simYears;
+
+    T.reportPeriodBessDegradation_HUF = (deltaSoH ./ 0.2) .* capexBess;
+    T.reportPeriodBessOpex_HUF = capexBess .* evalCfg.economics.bess_opex_frac_per_year .* simYears;
+
+    T.reportPeriodInvestmentCost_HUF = ...
+        T.reportPeriodPVCapex_HUF + ...
+        T.reportPeriodPVOpex_HUF + ...
+        T.reportPeriodInverterCapex_HUF + ...
+        T.reportPeriodInverterOpex_HUF + ...
+        T.reportPeriodBessDegradation_HUF + ...
+        T.reportPeriodBessOpex_HUF;
+
+    % A teljes szimulalt idoszak energiakoltseg-megtakaritasa.
+    T.reportPeriodCostSaving_HUF = local_col(T, 'energyCostSavings_HUF', zeros(n, 1));
+
+    % Saját, egyszeru riportmutato: megtakaritas - periodusra allokalt koltsegek.
+    T.reportPeriodNetValue_HUF = ...
+        T.reportPeriodCostSaving_HUF - T.reportPeriodInvestmentCost_HUF;
+
+    % ---------------------------------------------------------------------
+    % BESS-only periodusmutatok
+    % ---------------------------------------------------------------------
+    importPrice_HUF_per_kWh = local_get_import_price(T, cfg);
+
+    T.reportPeriodBessAcSaving_HUF = ...
+        local_col(T, 'bessToLoad_kWh', zeros(n, 1)) .* importPrice_HUF_per_kWh;
+
+    T.reportPeriodBessAcSaving_HUF(~hasBess) = 0;
+
+    T.reportPeriodBessOnlyCost_HUF = ...
+        T.reportPeriodBessDegradation_HUF + T.reportPeriodBessOpex_HUF;
+
+    T.reportPeriodBessOnlyNetValue_HUF = ...
+        T.reportPeriodBessAcSaving_HUF - T.reportPeriodBessOnlyCost_HUF;
+
+    % ---------------------------------------------------------------------
+    % Energia es veszteseg bontas a teljes szimulalt idoszakra
+    % ---------------------------------------------------------------------
+    T.reportUsefulACEnergy_MWh = ...
+        (local_col(T, 'pvToLoad_kWh', zeros(n, 1)) + ...
+         local_col(T, 'bessToLoad_kWh', zeros(n, 1))) ./ 1000;
+
+    invLoss = local_col(T, 'inverterConversionLoss_kWh', zeros(n, 1));
+
+    if all(abs(invLoss) < 1e-12)
+        invLoss = local_col(T, 'inverterLoss_kWh', zeros(n, 1));
     end
 
-    T.reportUsefulACEnergy_MWh_per_year = ...
-        (T.pvToLoad_kWh + T.bessToLoad_kWh) ./ simYears ./ 1000;
+    T.reportInverterLoss_MWh = invLoss ./ 1000;
 
-    T.reportInverterLoss_MWh_per_year = ...
-        local_get_column_or_zero(T, 'inverterConversionLoss_kWh') ./ simYears ./ 1000;
+    T.reportDcdcLoss_MWh = ...
+        local_col(T, 'dcdcConversionLoss_kWh', zeros(n, 1)) ./ 1000;
 
-    if all(abs(T.reportInverterLoss_MWh_per_year) < 1e-12)
-        T.reportInverterLoss_MWh_per_year = ...
-            local_get_column_or_zero(T, 'inverterLoss_kWh') ./ simYears ./ 1000;
+    % Itt szandekosan nem a bessTotalInternalLoss_kWh mezot hasznaljuk,
+    % mert az SoC limit / ures-tele miatti nem hasznosult request veszteseggel
+    % nagyon nagyra tud noni. A fizikai belso akkuveszteseghez a cell loss a
+    % megfelelobb riportmező.
+    T.reportBessInternalLoss_MWh = ...
+        local_col(T, 'bessCellLoss_kWh', zeros(n, 1)) ./ 1000;
+
+    T.reportCurtailment_MWh = ...
+        local_col(T, 'curtailment_kWh', zeros(n, 1)) ./ 1000;
+
+    % ---------------------------------------------------------------------
+    % Technikai mutatok fallback mezokkel
+    % ---------------------------------------------------------------------
+    if ~ismember('selfConsumption_pct', T.Properties.VariableNames)
+        T.selfConsumption_pct = 100 * local_col(T, 'selfConsumptionRatio', zeros(n, 1));
     end
 
-    T.reportDcdcLoss_MWh_per_year = ...
-        local_get_column_or_zero(T, 'dcdcConversionLoss_kWh') ./ simYears ./ 1000;
+    if ~ismember('selfSufficiency_pct', T.Properties.VariableNames)
+        T.selfSufficiency_pct = 100 * local_col(T, 'selfSufficiencyRatio', zeros(n, 1));
+    end
 
-    T.reportBessInternalLoss_MWh_per_year = ...
-        local_get_column_or_zero(T, 'bessTotalInternalLoss_kWh') ./ simYears ./ 1000;
-
-    T.reportCurtailment_MWh_per_year = ...
-        local_get_column_or_zero(T, 'curtailment_kWh') ./ simYears ./ 1000;
-
-    % A cfg bemenet itt szandekosan megmarad, mert kesobb lehet topologia- vagy
-    % koltsegfuggo riportmezokkel boviteni.
-    %#ok<NASGU>
-    cfg = cfg;
+    if ~ismember('annualBessEquivalentCycles', T.Properties.VariableNames)
+        T.annualBessEquivalentCycles = local_col(T, 'bessEquivalentCycles', zeros(n, 1)) ./ simYears;
+    end
 end
 
 
-function x = local_get_column_or_zero(T, name)
+function importPrice = local_get_import_price(T, cfg)
+
+    n = height(T);
+
+    if isfield(cfg, 'cost') && isfield(cfg.cost, 'grid_import_huf_per_kWh')
+        importPrice = repmat(cfg.cost.grid_import_huf_per_kWh, n, 1);
+        return;
+    end
+
+    if ismember('gridOnlyEnergyCost_HUF', T.Properties.VariableNames) && ...
+       ismember('loadEnergy_kWh', T.Properties.VariableNames)
+        importPrice = T.gridOnlyEnergyCost_HUF ./ max(T.loadEnergy_kWh, eps);
+        importPrice(~isfinite(importPrice)) = 0;
+        return;
+    end
+
+    error('Cannot determine grid import price for BESS-only value calculation.');
+end
+
+
+function x = local_col(T, name, defaultValue)
 
     if ismember(name, T.Properties.VariableNames)
         x = T.(name);
     else
-        x = zeros(height(T), 1);
+        x = defaultValue;
     end
+
+    x = double(x);
 end
 
 
 % =========================================================================
 % CANDIDATE SELECTION
 % =========================================================================
-function selected = local_select_report_candidates(T, options) %#ok<INUSD>
+function selected = local_select_report_candidates(T)
 
     validBase = logical(T.wasSimulated) & ~logical(T.hasError);
 
@@ -277,14 +355,14 @@ function selected = local_select_report_candidates(T, options) %#ok<INUSD>
     selectedTable = [onlyPv; dcBestLcse; dcBestNpv; acBestLcse; acBestNpv];
 
     labels = [ ...
-        "Best only PV"; ...
-        "Best DC by LCSE"; ...
-        "Best DC by NPV"; ...
-        "Best AC by LCSE"; ...
-        "Best AC by NPV"];
+        "Legjobb csak PV"; ...
+        "Legjobb DC - LCSE"; ...
+        "Legjobb DC - NPV"; ...
+        "Legjobb AC - LCSE"; ...
+        "Legjobb AC - NPV"];
 
     shortLabels = [ ...
-        "PV only"; ...
+        "Csak PV"; ...
         "DC LCSE"; ...
         "DC NPV"; ...
         "AC LCSE"; ...
@@ -345,8 +423,6 @@ end
 % =========================================================================
 function S = local_build_selected_summary_table(T, labels)
 
-    n = height(T);
-
     S = table();
     S.Selection = labels(:);
     S.Coupling = T.Coupling;
@@ -365,7 +441,6 @@ function S = local_build_selected_summary_table(T, labels)
     S.PV_to_BESS_MWh_total = T.pvToBess_kWh ./ 1000;
     S.BESS_to_load_MWh_total = T.bessToLoad_kWh ./ 1000;
     S.Grid_import_MWh_total = T.gridImport_kWh ./ 1000;
-    S.Grid_export_MWh_total = T.gridExport_kWh ./ 1000;
     S.Curtailment_MWh_total = T.curtailment_kWh ./ 1000;
 
     S.Grid_import_reduction_pct = T.gridImportReduction_pct;
@@ -380,25 +455,40 @@ function S = local_build_selected_summary_table(T, labels)
     S.Inverter_CAPEX_millionHUF = T.capexInverter_HUF ./ 1e6;
     S.BESS_CAPEX_millionHUF = T.capexBESS_HUF ./ 1e6;
 
-    S.Annual_energy_cost_saving_millionHUF = T.reportAnnualCostSaving_HUF ./ 1e6;
-    S.Annual_PV_CAPEX_millionHUF = T.reportAnnualPVCapex_HUF ./ 1e6;
-    S.Annual_PV_OPEX_millionHUF = T.reportAnnualPVOpex_HUF ./ 1e6;
-    S.Annual_inverter_CAPEX_millionHUF = T.reportAnnualInverterCapex_HUF ./ 1e6;
-    S.Annual_inverter_OPEX_millionHUF = T.reportAnnualInverterOpex_HUF ./ 1e6;
-    S.Annual_BESS_degradation_millionHUF = T.reportAnnualBessDegradation_HUF ./ 1e6;
-    S.Annual_BESS_OPEX_millionHUF = T.reportAnnualBessOpex_HUF ./ 1e6;
+    S.Period_energy_cost_saving_millionHUF = T.reportPeriodCostSaving_HUF ./ 1e6;
+    S.Period_PV_CAPEX_millionHUF = T.reportPeriodPVCapex_HUF ./ 1e6;
+    S.Period_PV_OPEX_millionHUF = T.reportPeriodPVOpex_HUF ./ 1e6;
+    S.Period_inverter_CAPEX_millionHUF = T.reportPeriodInverterCapex_HUF ./ 1e6;
+    S.Period_inverter_OPEX_millionHUF = T.reportPeriodInverterOpex_HUF ./ 1e6;
+    S.Period_BESS_degradation_CAPEX_millionHUF = T.reportPeriodBessDegradation_HUF ./ 1e6;
+    S.Period_BESS_OPEX_millionHUF = T.reportPeriodBessOpex_HUF ./ 1e6;
+    S.Period_net_value_millionHUF = T.reportPeriodNetValue_HUF ./ 1e6;
+
+    S.BESS_AC_energy_saving_millionHUF = T.reportPeriodBessAcSaving_HUF ./ 1e6;
+    S.BESS_only_cost_millionHUF = T.reportPeriodBessOnlyCost_HUF ./ 1e6;
+    S.BESS_only_net_value_millionHUF = T.reportPeriodBessOnlyNetValue_HUF ./ 1e6;
 
     S.LCSE_HUF_per_kWh_saved = T.LCSE_HUF_per_kWh_saved;
-    S.LCOE_usefulPV_HUF_per_kWh = T.LCOE_usefulPV_HUF_per_kWh;
     S.NPV_millionHUF = T.NPV_millionHUF;
     S.NPV_BESSOnly_millionHUF = T.NPV_BESSOnly_millionHUF;
-    S.Period_net_value_millionHUF = T.reportPeriodNetValue_HUF ./ 1e6;
     S.Simple_payback_year = T.simplePayback_year;
     S.Discounted_payback_year = T.discountedPayback_year;
+end
 
-    if height(S) ~= n
-        error('Internal table construction error.');
-    end
+
+function B = local_build_bess_only_table(T, labels)
+
+    B = table();
+    B.Selection = labels(:);
+    B.Coupling = T.Coupling;
+    B.candidateIndex = T.candidateIndex;
+    B.E_BESS_kWh = T.E_BESS_kWh;
+    B.P_BESS_kW = T.P_BESS_kW;
+    B.BESS_to_load_MWh_total = T.bessToLoad_kWh ./ 1000;
+    B.BESS_AC_energy_saving_millionHUF = T.reportPeriodBessAcSaving_HUF ./ 1e6;
+    B.BESS_degradation_CAPEX_millionHUF = T.reportPeriodBessDegradation_HUF ./ 1e6;
+    B.BESS_OPEX_millionHUF = T.reportPeriodBessOpex_HUF ./ 1e6;
+    B.BESS_only_net_value_millionHUF = T.reportPeriodBessOnlyNetValue_HUF ./ 1e6;
 end
 
 
@@ -454,15 +544,15 @@ function local_plot_3d_metric(T, metricField, metricLabel, metricUnit, direction
         bestRow.P_inv_kW, ...
         bestRow.DCAC_ratio, ...
         bestRow.BESS_PV_ratio, ...
-        sprintf('  best: C%d', bestRow.candidateIndex), ...
+        sprintf('  legjobb: C%d', bestRow.candidateIndex), ...
         'FontWeight', 'bold', ...
         'Interpreter', 'none');
 
-    xlabel(ax, 'Inverter nominal power [kW]');
-    ylabel(ax, 'DC/AC ratio [-]');
-    zlabel(ax, 'BESS/PV ratio [kWh/kWp]');
+    xlabel(ax, 'Inverter nevleges teljesitmeny [kW]');
+    ylabel(ax, 'DC/AC arany [-]');
+    zlabel(ax, 'BESS/PV arany [kWh/kWp]');
 
-    title(ax, sprintf('%s-coupled: %s', upper(char(coupling)), metricLabel), ...
+    title(ax, sprintf('%s-csatolt: %s', upper(char(coupling)), metricLabel), ...
         'Interpreter', 'none');
 
     cb = colorbar(ax);
@@ -481,33 +571,33 @@ end
 function local_plot_value_cost_payback_summary(T, xLabels, figureFolder)
 
     fig = figure('Name', 'AC/DC selected value cost payback summary', ...
-        'Position', [60, 60, 1500, 1000]);
+        'Position', [50, 40, 1550, 1250]);
 
-    tiledlayout(fig, 3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+    tiledlayout(fig, 4, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
 
     x = 1:height(T);
 
     % ---------------------------------------------------------------------
-    % 1) Annual system added value as energy cost saving
+    % 1) Rendszer hozzaadott erteke a teljes szimulalt idoszakra
     % ---------------------------------------------------------------------
     ax1 = nexttile;
     hold(ax1, 'on');
     grid(ax1, 'on');
     box(ax1, 'on');
 
-    annualSaving_mHUF = T.reportAnnualCostSaving_HUF ./ 1e6;
-    bar(ax1, x, annualSaving_mHUF, 'BarWidth', 0.65);
+    saving_mHUF = T.reportPeriodCostSaving_HUF ./ 1e6;
+    bar(ax1, x, saving_mHUF, 'BarWidth', 0.65);
     yline(ax1, 0, 'k-', 'LineWidth', 1.0);
 
-    ylabel(ax1, 'million HUF/year');
-    title(ax1, 'System added value as annual electricity cost saving');
+    ylabel(ax1, 'millio Ft');
+    title(ax1, 'Rendszer hozzaadott erteke - energiakoltseg-megtakaritas a szimulalt idoszakra');
     xticks(ax1, x);
     xticklabels(ax1, cellstr(xLabels));
 
-    local_add_bar_value_labels(ax1, x, annualSaving_mHUF);
+    local_add_bar_value_labels(ax1, x, saving_mHUF);
 
     % ---------------------------------------------------------------------
-    % 2) Annual cost components
+    % 2) Periodusra allokalt beruhazasi es OPEX komponensek
     % ---------------------------------------------------------------------
     ax2 = nexttile;
     hold(ax2, 'on');
@@ -515,17 +605,17 @@ function local_plot_value_cost_payback_summary(T, xLabels, figureFolder)
     box(ax2, 'on');
 
     costData_mHUF = [ ...
-        T.reportAnnualPVCapex_HUF, ...
-        T.reportAnnualPVOpex_HUF, ...
-        T.reportAnnualInverterCapex_HUF, ...
-        T.reportAnnualInverterOpex_HUF, ...
-        T.reportAnnualBessDegradation_HUF, ...
-        T.reportAnnualBessOpex_HUF] ./ 1e6;
+        T.reportPeriodPVCapex_HUF, ...
+        T.reportPeriodPVOpex_HUF, ...
+        T.reportPeriodInverterCapex_HUF, ...
+        T.reportPeriodInverterOpex_HUF, ...
+        T.reportPeriodBessDegradation_HUF, ...
+        T.reportPeriodBessOpex_HUF] ./ 1e6;
 
     bar(ax2, x, costData_mHUF, 'stacked', 'BarWidth', 0.65);
 
-    ylabel(ax2, 'million HUF/year');
-    title(ax2, 'Annual investment and OPEX components');
+    ylabel(ax2, 'millio Ft');
+    title(ax2, 'Szimulalt idoszakra allokalt beruhazasi es uzemeltetesi koltsegek');
     xticks(ax2, x);
     xticklabels(ax2, cellstr(xLabels));
 
@@ -534,12 +624,12 @@ function local_plot_value_cost_payback_summary(T, xLabels, figureFolder)
         'PV OPEX', ...
         'Inverter CAPEX / lifetime', ...
         'Inverter OPEX', ...
-        'BESS degradation: deltaSoH / 0.2 * CAPEX', ...
+        'BESS degradacios CAPEX', ...
         'BESS OPEX'}, ...
         'Location', 'bestoutside');
 
     % ---------------------------------------------------------------------
-    % 3) Net value over simulated period
+    % 3) Netto periodusertek
     % ---------------------------------------------------------------------
     ax3 = nexttile;
     hold(ax3, 'on');
@@ -550,12 +640,50 @@ function local_plot_value_cost_payback_summary(T, xLabels, figureFolder)
     bar(ax3, x, periodNet_mHUF, 'BarWidth', 0.65);
     yline(ax3, 0, 'k-', 'LineWidth', 1.0);
 
-    ylabel(ax3, 'million HUF');
-    title(ax3, 'Net value over simulated period (positive means economically beneficial)');
+    ylabel(ax3, 'millio Ft');
+    title(ax3, 'Megterulesi ertek a szimulalt idoszakra - pozitiv ertek eseten gazdasagilag kedvezo');
     xticks(ax3, x);
     xticklabels(ax3, cellstr(xLabels));
 
     local_add_bar_value_labels(ax3, x, periodNet_mHUF);
+
+    % ---------------------------------------------------------------------
+    % 4) BESS-only periodusertek
+    % ---------------------------------------------------------------------
+    ax4 = nexttile;
+    hold(ax4, 'on');
+    grid(ax4, 'on');
+    box(ax4, 'on');
+
+    bessValueStack_mHUF = [ ...
+        T.reportPeriodBessAcSaving_HUF, ...
+        -T.reportPeriodBessDegradation_HUF, ...
+        -T.reportPeriodBessOpex_HUF] ./ 1e6;
+
+    bar(ax4, x, bessValueStack_mHUF, 'stacked', 'BarWidth', 0.65);
+
+    bessNet_mHUF = T.reportPeriodBessOnlyNetValue_HUF ./ 1e6;
+
+    plot(ax4, x, bessNet_mHUF, 'k-o', ...
+        'LineWidth', 1.6, ...
+        'MarkerSize', 5, ...
+        'DisplayName', 'BESS-only netto ertek');
+
+    yline(ax4, 0, 'k-', 'LineWidth', 1.0);
+
+    ylabel(ax4, 'millio Ft');
+    title(ax4, 'BESS-only vizsgalat: BESS AC energiaertek - BESS degradacios CAPEX - BESS OPEX');
+    xticks(ax4, x);
+    xticklabels(ax4, cellstr(xLabels));
+
+    legend(ax4, { ...
+        'BESS -> fogyaszto AC energia megtakaritasa', ...
+        'BESS degradacios CAPEX', ...
+        'BESS OPEX', ...
+        'BESS-only netto ertek'}, ...
+        'Location', 'bestoutside');
+
+    local_add_bar_value_labels(ax4, x, bessNet_mHUF);
 
     local_save_figure(fig, figureFolder, 'acdc_selected_value_cost_payback_summary');
 end
@@ -571,9 +699,9 @@ function local_plot_self_consumption_summary(T, xLabels, figureFolder)
     x = 1:height(T);
 
     metrics = { ...
-        'selfConsumption_pct', 'Self-consumption', '%'; ...
-        'selfSufficiency_pct', 'Self-sufficiency', '%'; ...
-        'annualBessEquivalentCycles', 'Equivalent cycles', 'cycles/year'};
+        'selfConsumption_pct', 'Onfogyasztasi arany', '%'; ...
+        'selfSufficiency_pct', 'Onellatasi arany', '%'; ...
+        'annualBessEquivalentCycles', 'Eves ekvivalens BESS ciklusszam', 'ciklus/ev'};
 
     for k = 1:size(metrics, 1)
         ax = nexttile;
@@ -610,24 +738,24 @@ function local_plot_useful_energy_and_losses(T, xLabels, figureFolder)
     x = 1:height(T);
 
     energyData_MWh = [ ...
-        T.reportUsefulACEnergy_MWh_per_year, ...
-        T.reportInverterLoss_MWh_per_year, ...
-        T.reportDcdcLoss_MWh_per_year, ...
-        T.reportBessInternalLoss_MWh_per_year, ...
-        T.reportCurtailment_MWh_per_year];
+        T.reportUsefulACEnergy_MWh, ...
+        T.reportInverterLoss_MWh, ...
+        T.reportDcdcLoss_MWh, ...
+        T.reportBessInternalLoss_MWh, ...
+        T.reportCurtailment_MWh];
 
     bar(ax, x, energyData_MWh, 'stacked', 'BarWidth', 0.65);
 
-    ylabel(ax, 'MWh/year');
-    title(ax, 'Useful AC energy and main loss components');
+    ylabel(ax, 'MWh / szimulalt idoszak');
+    title(ax, 'Hasznos AC energia es fo vesztesegkomponensek');
     xticks(ax, x);
     xticklabels(ax, cellstr(xLabels));
 
     legend(ax, { ...
-        'Useful AC energy to load', ...
-        'Inverter loss', ...
-        'DC/DC loss', ...
-        'BESS internal loss', ...
+        'Hasznos AC energia a fogyaszton', ...
+        'Inverter veszteseg', ...
+        'DC/DC veszteseg', ...
+        'BESS cella/belso veszteseg', ...
         'Curtailment'}, ...
         'Location', 'bestoutside');
 
